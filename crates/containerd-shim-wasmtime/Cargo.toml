@@ -15,6 +15,7 @@ tokio-util = { workspace = true, features = ["rt"] }
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }
+hyper-util = { workspace = true }
 
 [dev-dependencies]
 containerd-shim-wasm = { workspace = true, features = ["testing"] }

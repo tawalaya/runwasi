@@ -1015,6 +1015,7 @@ dependencies = [
  "anyhow",
  "containerd-shim-wasm",
  "hyper 1.6.0",
+ "hyper-util",
  "libc",
  "log",
  "reqwest 0.12.9",

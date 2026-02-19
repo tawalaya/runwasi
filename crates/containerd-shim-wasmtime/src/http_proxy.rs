@@ -10,6 +10,8 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use containerd_shim_wasm::sandbox::context::RuntimeContext;
 use hyper::server::conn::http1;
+use hyper_util::rt::TokioExecutor;
+use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -100,10 +102,22 @@ pub(crate) async fn serve_conn(
     let listener = socket.listen(backlog)?;
     let tracker = TaskTracker::new();
 
-    log::info!("Serving HTTP on http://{}/", listener.local_addr()?);
+    // Determine server mode via env: "http1", "http2"/"h2" or "auto" (default = "auto")
+    let mode = env
+        .remove("WASMTIME_HTTP_PROXY_SERVER_MODE")
+        .unwrap_or_else(|| "auto".to_string());
+    #[derive(Debug, Clone, Copy)]
+    enum ServerMode { Http1, Auto }
+    let mode = match mode.to_ascii_lowercase().as_str() {
+        "http1" => ServerMode::Http1,
+        "http2" | "h2" | "auto" => ServerMode::Auto,
+        _ => ServerMode::Auto,
+    };
 
     let env = env.into_iter().collect();
     let handler = Arc::new(ProxyHandler::new(instance, env, tracker.clone()));
+
+    log::info!("Serving HTTP on http://{} (mode: {:?})", listener.local_addr()?, mode);
 
     loop {
         let stream = tokio::select! {
@@ -121,16 +135,26 @@ pub(crate) async fn serve_conn(
         let stream = TokioIo::new(stream);
         let h = handler.clone();
 
-        tracker.spawn(async {
-            if let Err(e) = http1::Builder::new()
-                .keep_alive(true)
-                .serve_connection(
-                    stream,
-                    hyper::service::service_fn(move |req| h.clone().handle_request(req)),
-                )
-                .await
-            {
-                log::error!("error: {e:?}");
+        tracker.spawn(async move {
+            let svc = hyper::service::service_fn(move |req| h.clone().handle_request(req));
+            match mode {
+                ServerMode::Http1 => {
+                    if let Err(e) = http1::Builder::new()
+                        .keep_alive(true)
+                        .serve_connection(stream, svc)
+                        .await
+                    {
+                        log::error!("error: {e:?}");
+                    }
+                }
+                ServerMode::Auto => {
+                    if let Err(e) = AutoServerBuilder::new(TokioExecutor::new())
+                        .serve_connection(stream, svc)
+                        .await
+                    {
+                        log::error!("error: {e:?}");
+                    }
+                }
             }
         });
     }
