@@ -16,7 +16,11 @@ use wasmtime::{Config, Module, Precompiled, Store};
 use wasmtime_wasi::p2::{self as wasi_preview2};
 use wasmtime_wasi::preview1::{self as wasi_preview1};
 use wasmtime_wasi_http::bindings::ProxyPre;
-use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
+use wasmtime_wasi_http::body::HyperOutgoingBody;
+use wasmtime_wasi_http::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
+use wasmtime_wasi_http::{HttpResult, WasiHttpCtx, WasiHttpView};
+
+use crate::h2c::h2c_send_request;
 
 use crate::http_proxy::serve_conn;
 
@@ -88,6 +92,9 @@ pub struct WasiPreview2Ctx {
     pub(crate) wasi_ctx: wasi_preview2::WasiCtx,
     pub(crate) wasi_http: WasiHttpCtx,
     pub(crate) resource_table: ResourceTable,
+    /// When true, outgoing plaintext HTTP requests use HTTP/2 prior-knowledge (h2c)
+    /// instead of HTTP/1.1. Required for gRPC communication.
+    pub(crate) outgoing_h2c: bool,
 }
 
 impl WasiPreview2Ctx {
@@ -97,6 +104,7 @@ impl WasiPreview2Ctx {
             wasi_ctx: wasi_builder(ctx)?.build(),
             wasi_http: WasiHttpCtx::new(),
             resource_table: ResourceTable::default(),
+            outgoing_h2c: false,
         })
     }
 }
@@ -117,6 +125,19 @@ impl wasi_preview2::IoView for WasiPreview2Ctx {
 impl WasiHttpView for WasiPreview2Ctx {
     fn ctx(&mut self) -> &mut wasmtime_wasi_http::WasiHttpCtx {
         &mut self.wasi_http
+    }
+
+    fn send_request(
+        &mut self,
+        request: hyper::Request<HyperOutgoingBody>,
+        config: OutgoingRequestConfig,
+    ) -> HttpResult<HostFutureIncomingResponse> {
+        if self.outgoing_h2c {
+            log::debug!("Using h2c (HTTP/2 prior-knowledge) for outgoing request");
+            Ok(h2c_send_request(request, config))
+        } else {
+            Ok(wasmtime_wasi_http::types::default_send_request(request, config))
+        }
     }
 }
 

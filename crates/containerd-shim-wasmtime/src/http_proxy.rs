@@ -108,6 +108,8 @@ pub(crate) async fn serve_conn(
         .unwrap_or_else(|| "auto".to_string());
     #[derive(Debug, Clone, Copy)]
     enum ServerMode { Http1, Auto }
+    // When mode is "http2" or "h2", also enable h2c for outgoing requests (gRPC support)
+    let outgoing_h2c = matches!(mode.to_ascii_lowercase().as_str(), "http2" | "h2");
     let mode = match mode.to_ascii_lowercase().as_str() {
         "http1" => ServerMode::Http1,
         "http2" | "h2" | "auto" => ServerMode::Auto,
@@ -115,7 +117,7 @@ pub(crate) async fn serve_conn(
     };
 
     let env = env.into_iter().collect();
-    let handler = Arc::new(ProxyHandler::new(instance, env, tracker.clone()));
+    let handler = Arc::new(ProxyHandler::new(instance, env, tracker.clone(), outgoing_h2c));
 
     log::info!("Serving HTTP on http://{} (mode: {:?})", listener.local_addr()?, mode);
 
@@ -170,6 +172,8 @@ struct ProxyHandler {
     next_id: AtomicU64,
     env: Vec<(String, String)>,
     tracker: TaskTracker,
+    /// When true, outgoing plaintext HTTP requests use HTTP/2 prior-knowledge (h2c).
+    outgoing_h2c: bool,
 }
 
 impl ProxyHandler {
@@ -177,12 +181,14 @@ impl ProxyHandler {
         instance_pre: ProxyPre<WasiPreview2Ctx>,
         env: Vec<(String, String)>,
         tracker: TaskTracker,
+        outgoing_h2c: bool,
     ) -> Self {
         ProxyHandler {
             instance_pre,
             env,
             tracker,
             next_id: AtomicU64::from(0),
+            outgoing_h2c,
         }
     }
 
@@ -197,6 +203,7 @@ impl ProxyHandler {
             wasi_ctx: builder.build(),
             wasi_http: WasiHttpCtx::new(),
             resource_table: ResourceTable::default(),
+            outgoing_h2c: self.outgoing_h2c,
         };
 
         Store::new(engine, ctx)

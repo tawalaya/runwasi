@@ -1,3 +1,4 @@
+pub(crate) mod h2c;
 mod http_proxy;
 pub mod instance;
 

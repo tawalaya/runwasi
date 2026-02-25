@@ -16,6 +16,8 @@ wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }
 hyper-util = { workspace = true }
+http-body-util = "0.1"
+http = "1"
 
 [dev-dependencies]
 containerd-shim-wasm = { workspace = true, features = ["testing"] }
