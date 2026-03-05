@@ -203,9 +203,14 @@ fn init_zygote_and_logger(debug: bool, config: &Config) {
     }
     zygote::Zygote::global().run(
         |(debug, default_log_level)| {
-            // last two arguments are unused in unix
-            crate::vendor::containerd_shim::logger::init(debug, &default_log_level, "", "")
-                .expect("Failed to initialize logger");
+            // last two arguments are unused in unix.
+            // The log FIFO may not exist yet for short-lived subcommands like
+            // `-info`, so we warn on stderr instead of panicking.
+            if let Err(e) =
+                crate::vendor::containerd_shim::logger::init(debug, &default_log_level, "", "")
+            {
+                eprintln!("Warning: failed to initialize FIFO logger ({e}), continuing without structured logging");
+            }
         },
         (debug, config.default_log_level.clone()),
     );
