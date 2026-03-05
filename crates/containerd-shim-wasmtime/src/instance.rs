@@ -1,6 +1,8 @@
 use std::hash::Hash;
 use std::sync::LazyLock;
 
+use std::time::Duration;
+
 use anyhow::{Context, Result, bail};
 use containerd_shim_wasm::sandbox::Sandbox;
 use containerd_shim_wasm::sandbox::context::{
@@ -12,7 +14,7 @@ use wasi_preview1::WasiP1Ctx;
 use wasi_preview2::bindings::Command;
 use wasmtime::component::types::ComponentItem;
 use wasmtime::component::{self, Component, ResourceTable};
-use wasmtime::{Config, Module, Precompiled, Store};
+use wasmtime::{Config, Module, Precompiled, StoreLimits, StoreLimitsBuilder, Store};
 use wasmtime_wasi::p2::{self as wasi_preview2};
 use wasmtime_wasi::preview1::{self as wasi_preview1};
 use wasmtime_wasi_http::bindings::ProxyPre;
@@ -59,6 +61,18 @@ pub struct WasmtimeShim;
 
 pub struct WasmtimeCompiler(wasmtime::Engine);
 
+/// Default per-instance Wasm linear memory limit (128 MiB).
+/// Override via `WASMTIME_MAX_MEMORY_SIZE` env var (bytes).
+const DEFAULT_MAX_MEMORY_SIZE: usize = 128 * 1024 * 1024;
+
+/// Default epoch-tick interval for the background ticker (10 ms).
+const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Default per-request epoch deadline in ticks.
+/// 3000 ticks × 10 ms = 30 s.
+/// Override via `WASMTIME_EPOCH_TIMEOUT_MS` env var.
+const DEFAULT_EPOCH_DEADLINE_TICKS: u64 = 3000;
+
 pub struct WasmtimeSandbox {
     engine: wasmtime::Engine,
     cancel: CancellationToken,
@@ -74,15 +88,41 @@ impl Default for WasmtimeSandbox {
         config.wasm_component_model(true); // enable component linking
         config.async_support(true); // must be on
 
+        // Enable epoch-based interruption so runaway guests can be preempted.
+        config.epoch_interruption(true);
+
         if use_pooling_allocator_by_default() {
-            let cfg = wasmtime::PoolingAllocationConfig::default();
+            let mut cfg = wasmtime::PoolingAllocationConfig::default();
+            // Bound per-instance memory to match StoreLimits.
+            cfg.max_memory_size(DEFAULT_MAX_MEMORY_SIZE);
+            // Cap the total pools to reasonable values for a container workload.
+            cfg.total_memories(200);
+            cfg.total_tables(200);
+            cfg.total_stacks(200);
+            cfg.total_component_instances(200);
+            cfg.total_core_instances(500);
             config.allocation_strategy(wasmtime::InstanceAllocationStrategy::Pooling(cfg));
         }
 
+        let engine = wasmtime::Engine::new(&config)
+            .context("failed to create wasmtime engine")
+            .unwrap();
+
+        // Spawn a background task that increments the epoch on a fixed interval.
+        // This drives the epoch-interruption deadlines set on individual Stores.
+        let ticker_engine = engine.clone();
+        std::thread::Builder::new()
+            .name("epoch-ticker".into())
+            .spawn(move || {
+                loop {
+                    std::thread::sleep(EPOCH_TICK_INTERVAL);
+                    ticker_engine.increment_epoch();
+                }
+            })
+            .expect("failed to spawn epoch ticker thread");
+
         Self {
-            engine: wasmtime::Engine::new(&config)
-                .context("failed to create wasmtime engine")
-                .unwrap(),
+            engine,
             cancel: CancellationToken::new(),
         }
     }
@@ -92,6 +132,8 @@ pub struct WasiPreview2Ctx {
     pub(crate) wasi_ctx: wasi_preview2::WasiCtx,
     pub(crate) wasi_http: WasiHttpCtx,
     pub(crate) resource_table: ResourceTable,
+    /// Wasmtime resource limits (memory, tables, instances).
+    pub(crate) store_limits: StoreLimits,
     /// When true, outgoing plaintext HTTP requests use HTTP/2 prior-knowledge (h2c)
     /// instead of HTTP/1.1. Required for gRPC communication.
     pub(crate) outgoing_h2c: bool,
@@ -104,9 +146,33 @@ impl WasiPreview2Ctx {
             wasi_ctx: wasi_builder(ctx)?.build(),
             wasi_http: WasiHttpCtx::new(),
             resource_table: ResourceTable::default(),
+            store_limits: default_store_limits(),
             outgoing_h2c: false,
         })
     }
+}
+
+/// Build the default `StoreLimits` used for every Wasm instance.
+///
+/// Caps linear memory growth to `DEFAULT_MAX_MEMORY_SIZE` (128 MiB) so a single
+/// misbehaving guest cannot OOM the entire shim process.
+pub(crate) fn default_store_limits() -> StoreLimits {
+    StoreLimitsBuilder::new()
+        .memory_size(DEFAULT_MAX_MEMORY_SIZE)
+        .instances(100)
+        .tables(20)
+        .memories(20)
+        .trap_on_grow_failure(false)
+        .build()
+}
+
+/// Compute the epoch deadline (in ticks) from env or fall back to the default.
+pub(crate) fn epoch_deadline_from_env(env: &[(String, String)]) -> u64 {
+    env.iter()
+        .find(|(k, _)| k == "WASMTIME_EPOCH_TIMEOUT_MS")
+        .and_then(|(_, v)| v.parse::<u64>().ok())
+        .map(|ms| ms / EPOCH_TICK_INTERVAL.as_millis() as u64)
+        .unwrap_or(DEFAULT_EPOCH_DEADLINE_TICKS)
 }
 
 /// This impl is required to use wasmtime_wasi::preview2::WasiView trait.
@@ -232,6 +298,8 @@ impl WasmtimeSandbox {
 
         let ctx_p1 = wasi_builder(ctx)?.build_p1();
         let mut store = Store::new(&self.engine, ctx_p1);
+        // Set a generous epoch deadline for long-running command modules.
+        store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE_TICKS * 10);
         let mut module_linker = wasmtime::Linker::new(&self.engine);
 
         log::debug!("init linker");
@@ -405,11 +473,15 @@ pub(crate) fn envs_from_ctx(ctx: &impl RuntimeContext) -> Vec<(String, String)> 
         .collect()
 }
 
-fn store_for_context<T: wasi_preview2::WasiView>(
+fn store_for_context(
     engine: &wasmtime::Engine,
-    ctx: T,
-) -> Result<(Store<T>, component::Linker<T>)> {
-    let store = Store::new(engine, ctx);
+    ctx: WasiPreview2Ctx,
+) -> Result<(Store<WasiPreview2Ctx>, component::Linker<WasiPreview2Ctx>)> {
+    let mut store = Store::new(engine, ctx);
+    // Attach resource limiter (bounds memory growth).
+    store.limiter(|state| &mut state.store_limits);
+    // Set a generous epoch deadline for command / core components.
+    store.set_epoch_deadline(DEFAULT_EPOCH_DEADLINE_TICKS * 10);
 
     log::debug!("init linker");
     let mut linker = component::Linker::new(engine);

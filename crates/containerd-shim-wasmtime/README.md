@@ -31,12 +31,15 @@ This can be very useful on the Wasm-first platforms to allow instance-per-reques
 > mitigation: the blast radius of an exploit or guest-runtime bug is only a single request, and can never see the data
 > from other users of the platform or even other requests by the same user. [3]
 
-The server can be customized by setting environment variables passed to the `RuntimeContext`. These variables include:
+The server and runtime can be customized by setting environment variables passed to the `RuntimeContext`:
 
-- `WASMTIME_HTTP_PROXY_SOCKET_ADDR`: Defines the socket address to bind to
-  (default: 0.0.0.0:8080).
-- `WASMTIME_HTTP_PROXY_BACKLOG`: Defines the maximum number of pending
-  connections in the queue (default: 100).
+| Variable | Default | Description |
+|---|---|---|
+| `WASMTIME_HTTP_PROXY_SOCKET_ADDR` | `0.0.0.0:8080` | Socket address to bind the HTTP server to |
+| `WASMTIME_HTTP_PROXY_BACKLOG` | `100` | Maximum number of pending connections in the listen queue |
+| `WASMTIME_HTTP_PROXY_SERVER_MODE` | `auto` | HTTP server mode: `http1`, `http2` / `h2`, or `auto`. Setting `http2` also enables h2c for outgoing requests (gRPC) |
+| `WASMTIME_HTTP_PROXY_ALLOW_NETWORK` | `false` | Allow guest components to make outgoing network connections (`true`, `1`, or `yes` to enable) |
+| `WASMTIME_EPOCH_TIMEOUT_MS` | `30000` | Per-request epoch deadline in milliseconds. Controls how often a long-running guest yields back to the async runtime |
 
 #### Getting Started
 First, we need to create a Wasm component that uses `http/proxy`. You can follow the instructions in this [article][4]

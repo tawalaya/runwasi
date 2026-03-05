@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use containerd_shim_wasm::sandbox::context::RuntimeContext;
-use hyper::server::conn::http1;
+use hyper::server::conn::{http1, http2};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use tokio::net::{TcpListener, TcpStream};
@@ -23,7 +23,7 @@ use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
-use crate::instance::{WasiPreview2Ctx, envs_from_ctx};
+use crate::instance::{WasiPreview2Ctx, envs_from_ctx, epoch_deadline_from_env, default_store_limits};
 
 const DEFAULT_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 8080);
@@ -44,7 +44,11 @@ fn is_connection_error(e: &std::io::Error) -> bool {
 // [From axum](https://github.com/tokio-rs/axum/blob/280d16a61059f57230819a79b15aa12a263e8cca/axum/src/serve.rs#L425)
 async fn tcp_accept(listener: &TcpListener) -> Option<TcpStream> {
     match listener.accept().await {
-        Ok((stream, _addr)) => Some(stream),
+        Ok((stream, _addr)) => {
+            // Disable Nagle's algorithm for low-latency gRPC / HTTP responses.
+            stream.set_nodelay(true).ok();
+            Some(stream)
+        }
         Err(e) => {
             if is_connection_error(&e) {
                 return None;
@@ -79,7 +83,7 @@ pub(crate) async fn serve_conn(
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_ADDR);
     let backlog = env
-        .remove("WASMTIME_HTTP_BACKLOG")
+        .remove("WASMTIME_HTTP_PROXY_BACKLOG")
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_BACKLOG);
 
@@ -107,19 +111,42 @@ pub(crate) async fn serve_conn(
         .remove("WASMTIME_HTTP_PROXY_SERVER_MODE")
         .unwrap_or_else(|| "auto".to_string());
     #[derive(Debug, Clone, Copy)]
-    enum ServerMode { Http1, Auto }
+    enum ServerMode { Http1, Http2, Auto }
     // When mode is "http2" or "h2", also enable h2c for outgoing requests (gRPC support)
     let outgoing_h2c = matches!(mode.to_ascii_lowercase().as_str(), "http2" | "h2");
     let mode = match mode.to_ascii_lowercase().as_str() {
         "http1" => ServerMode::Http1,
-        "http2" | "h2" | "auto" => ServerMode::Auto,
+        "http2" | "h2" => ServerMode::Http2,
+        "auto" => ServerMode::Auto,
         _ => ServerMode::Auto,
     };
 
-    let env = env.into_iter().collect();
-    let handler = Arc::new(ProxyHandler::new(instance, env, tracker.clone(), outgoing_h2c));
+    // Allow guest network access only when explicitly opted in (#5).
+    let allow_network = env
+        .remove("WASMTIME_HTTP_PROXY_ALLOW_NETWORK")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
+    let env: Vec<(String, String)> = env.into_iter().collect();
+    let epoch_deadline = epoch_deadline_from_env(&env);
+    let handler = Arc::new(ProxyHandler::new(instance, env, tracker.clone(), outgoing_h2c, epoch_deadline, allow_network));
 
     log::info!("Serving HTTP on http://{} (mode: {:?})", listener.local_addr()?, mode);
+
+    // Pre-build connection handlers outside the loop to avoid per-connection allocations (#7).
+    let http1_builder = {
+        let mut b = http1::Builder::new();
+        b.keep_alive(true);
+        b
+    };
+    let http2_builder = {
+        let mut b = http2::Builder::new(TokioExecutor::new());
+        b.initial_stream_window_size(1024 * 1024)
+         .initial_connection_window_size(2 * 1024 * 1024)
+         .max_concurrent_streams(200);
+        b
+    };
+    let auto_builder = AutoServerBuilder::new(TokioExecutor::new());
 
     loop {
         let stream = tokio::select! {
@@ -136,24 +163,25 @@ pub(crate) async fn serve_conn(
 
         let stream = TokioIo::new(stream);
         let h = handler.clone();
+        let h1b = http1_builder.clone();
+        let h2b = http2_builder.clone();
+        let ab = auto_builder.clone();
 
         tracker.spawn(async move {
             let svc = hyper::service::service_fn(move |req| h.clone().handle_request(req));
             match mode {
                 ServerMode::Http1 => {
-                    if let Err(e) = http1::Builder::new()
-                        .keep_alive(true)
-                        .serve_connection(stream, svc)
-                        .await
-                    {
+                    if let Err(e) = h1b.serve_connection(stream, svc).await {
+                        log::error!("error: {e:?}");
+                    }
+                }
+                ServerMode::Http2 => {
+                    if let Err(e) = h2b.serve_connection(stream, svc).await {
                         log::error!("error: {e:?}");
                     }
                 }
                 ServerMode::Auto => {
-                    if let Err(e) = AutoServerBuilder::new(TokioExecutor::new())
-                        .serve_connection(stream, svc)
-                        .await
-                    {
+                    if let Err(e) = ab.serve_connection(stream, svc).await {
                         log::error!("error: {e:?}");
                     }
                 }
@@ -174,6 +202,10 @@ struct ProxyHandler {
     tracker: TaskTracker,
     /// When true, outgoing plaintext HTTP requests use HTTP/2 prior-knowledge (h2c).
     outgoing_h2c: bool,
+    /// Per-request epoch deadline in ticks.
+    epoch_deadline: u64,
+    /// Whether the guest is allowed to make outgoing network connections.
+    allow_network: bool,
 }
 
 impl ProxyHandler {
@@ -182,6 +214,8 @@ impl ProxyHandler {
         env: Vec<(String, String)>,
         tracker: TaskTracker,
         outgoing_h2c: bool,
+        epoch_deadline: u64,
+        allow_network: bool,
     ) -> Self {
         ProxyHandler {
             instance_pre,
@@ -189,6 +223,8 @@ impl ProxyHandler {
             tracker,
             next_id: AtomicU64::from(0),
             outgoing_h2c,
+            epoch_deadline,
+            allow_network,
         }
     }
 
@@ -198,15 +234,30 @@ impl ProxyHandler {
 
         builder.envs(&self.env);
         builder.env("REQUEST_ID", req_id.to_string());
+        // Expose guest stdout/stderr so diagnostic logs reach containerd (#4).
+        builder.inherit_stdio();
+        // Only grant network access when WASMTIME_HTTP_PROXY_ALLOW_NETWORK is set (#5).
+        if self.allow_network {
+            builder.inherit_network();
+            builder.allow_tcp(true);
+            builder.allow_udp(true);
+            builder.allow_ip_name_lookup(true);
+        }
 
         let ctx = WasiPreview2Ctx {
             wasi_ctx: builder.build(),
             wasi_http: WasiHttpCtx::new(),
             resource_table: ResourceTable::default(),
+            store_limits: default_store_limits(),
             outgoing_h2c: self.outgoing_h2c,
         };
 
-        Store::new(engine, ctx)
+        let mut store = Store::new(engine, ctx);
+        // Attach resource limiter to cap memory growth per request (#2).
+        store.limiter(|state| &mut state.store_limits);
+        // Set epoch deadline so runaway guests are interrupted (#1).
+        store.epoch_deadline_async_yield_and_update(self.epoch_deadline);
+        store
     }
 
     async fn handle_request(
