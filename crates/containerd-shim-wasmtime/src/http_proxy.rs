@@ -112,14 +112,20 @@ pub(crate) async fn serve_conn(
         .unwrap_or_else(|| "auto".to_string());
     #[derive(Debug, Clone, Copy)]
     enum ServerMode { Http1, Http2, Auto }
-    // When mode is "http2" or "h2", also enable h2c for outgoing requests (gRPC support)
-    let outgoing_h2c = matches!(mode.to_ascii_lowercase().as_str(), "http2" | "h2");
     let mode = match mode.to_ascii_lowercase().as_str() {
         "http1" => ServerMode::Http1,
         "http2" | "h2" => ServerMode::Http2,
         "auto" => ServerMode::Auto,
         _ => ServerMode::Auto,
     };
+
+    // Outgoing h2c is independent from the incoming server mode.
+    // Only enable when explicitly requested — the default upstream behavior (HTTP/1.1) is
+    // more compatible with the variety of backends a guest might call.
+    let outgoing_h2c = env
+        .remove("WASMTIME_HTTP_PROXY_OUTGOING_H2C")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
 
     // Allow guest network access only when explicitly opted in (#5).
     let allow_network = env
