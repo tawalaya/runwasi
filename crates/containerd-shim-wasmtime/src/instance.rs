@@ -227,6 +227,9 @@ impl Shim for WasmtimeShim {
         config.parallel_compilation(!cfg!(test));
         config.wasm_component_model(true); // enable component linking
         config.async_support(true); // must be on
+        // Must match the sandbox engine — epoch_interruption is baked into
+        // precompiled artifacts and wasmtime rejects a mismatch at load time.
+        config.epoch_interruption(true);
 
         let engine = wasmtime::Engine::new(&config)
             .expect("failed to create wasmtime precompilation engine");
