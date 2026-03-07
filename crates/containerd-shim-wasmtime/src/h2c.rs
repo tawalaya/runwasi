@@ -51,16 +51,16 @@ async fn get_or_connect_h2(
         let pool = H2_POOL.lock().await;
         if let Some(entry) = pool.get(authority) {
             if entry.sender.is_ready() {
-                log::info!("h2c pool: reusing connection to {authority}");
+                log::debug!("h2c pool: reusing connection to {authority}");
                 return Ok(entry.sender.clone());
             }
             // Connection is no longer usable; fall through to create a new one.
-            log::info!("h2c pool: stale connection to {authority}, reconnecting");
+            log::debug!("h2c pool: stale connection to {authority}, reconnecting");
         }
     }
 
     // Slow path: open a new TCP connection + HTTP/2 handshake.
-    log::info!("h2c pool: opening new TCP connection to {authority}");
+    log::debug!("h2c pool: opening new TCP connection to {authority}");
     let tcp_stream = timeout(connect_timeout, TcpStream::connect(authority))
         .await
         .map_err(|_| {
@@ -90,13 +90,13 @@ async fn get_or_connect_h2(
             }
         }})?;
 
-    log::info!("h2c: TCP connected to {authority} (peer={:?})", tcp_stream.peer_addr());
+    log::debug!("h2c: TCP connected to {authority} (peer={:?})", tcp_stream.peer_addr());
 
     // Disable Nagle's algorithm — critical for gRPC's small, latency-sensitive frames.
     tcp_stream.set_nodelay(true).ok();
 
     let stream = TokioIo::new(tcp_stream);
-    log::info!("h2c: starting HTTP/2 handshake to {authority}");
+    log::debug!("h2c: starting HTTP/2 handshake to {authority}");
     let (sender, conn) = timeout(
         connect_timeout,
         hyper::client::conn::http2::handshake(TokioExecutor::new(), stream),
@@ -111,7 +111,7 @@ async fn get_or_connect_h2(
         hyper_request_error(e)
     })?;
 
-    log::info!("h2c: HTTP/2 handshake complete to {authority}");
+    log::debug!("h2c: HTTP/2 handshake complete to {authority}");
 
     // Drive the connection in the background; clean up pool entry on close.
     // IMPORTANT: The driver handle MUST be stored in the pool — dropping an
@@ -123,7 +123,7 @@ async fn get_or_connect_h2(
             if let Err(e) = conn.await {
                 log::warn!("h2c pool: connection to {key} closed with error: {e}");
             } else {
-                log::info!("h2c pool: connection to {key} closed cleanly");
+                log::debug!("h2c pool: connection to {key} closed cleanly");
             }
             H2_POOL.lock().await.remove(&key);
         }
@@ -182,7 +182,7 @@ async fn h2c_send_request_handler(
         return Err(wasi_http_types::ErrorCode::HttpRequestUriInvalid);
     };
 
-    log::info!("h2c_send_request_handler: authority={}, use_tls={}", authority, use_tls);
+    log::debug!("h2c_send_request_handler: authority={}, use_tls={}", authority, use_tls);
 
     // Strip scheme and authority from the URI — the HTTP packet should only
     // contain path+query when not addressing a proxy.
@@ -241,10 +241,10 @@ async fn h2c_send_request_handler(
         })
     } else {
         // HTTP/2 prior-knowledge (h2c) with connection pooling.
-        log::info!("h2c: getting/creating connection to {authority}");
+        log::debug!("h2c: getting/creating connection to {authority}");
         let mut sender = get_or_connect_h2(&authority, connect_timeout).await?;
 
-        log::info!(
+        log::debug!(
             "h2c: sending request to {authority}: method={}, uri={}, headers={:?}",
             request.method(),
             request.uri(),
@@ -263,7 +263,7 @@ async fn h2c_send_request_handler(
             })?
             .map(|body| body.map_err(hyper_request_error).boxed());
 
-        log::info!("h2c: got response from {authority}: status={}", resp.status());
+        log::debug!("h2c: got response from {authority}: status={}", resp.status());
 
         // No per-request worker needed — the pool's background task drives the connection.
         Ok(IncomingResponse {

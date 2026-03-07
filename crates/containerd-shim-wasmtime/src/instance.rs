@@ -198,7 +198,7 @@ impl WasiHttpView for WasiPreview2Ctx {
         request: hyper::Request<HyperOutgoingBody>,
         config: OutgoingRequestConfig,
     ) -> HttpResult<HostFutureIncomingResponse> {
-        log::info!(
+        log::debug!(
             "send_request: outgoing_h2c={}, method={}, uri={}, use_tls={}",
             self.outgoing_h2c,
             request.method(),
@@ -206,10 +206,10 @@ impl WasiHttpView for WasiPreview2Ctx {
             config.use_tls,
         );
         if self.outgoing_h2c {
-            log::info!("Using h2c (HTTP/2 prior-knowledge) for outgoing request");
+            log::debug!("Using h2c (HTTP/2 prior-knowledge) for outgoing request");
             Ok(h2c_send_request(request, config))
         } else {
-            log::info!("Using default_send_request (HTTP/1.1) for outgoing request");
+            log::debug!("Using default_send_request (HTTP/1.1) for outgoing request");
             Ok(wasmtime_wasi_http::types::default_send_request(request, config))
         }
     }
