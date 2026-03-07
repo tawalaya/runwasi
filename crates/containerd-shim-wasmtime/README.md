@@ -37,7 +37,8 @@ The server and runtime can be customized by setting environment variables passed
 |---|---|---|
 | `WASMTIME_HTTP_PROXY_SOCKET_ADDR` | `0.0.0.0:8080` | Socket address to bind the HTTP server to |
 | `WASMTIME_HTTP_PROXY_BACKLOG` | `100` | Maximum number of pending connections in the listen queue |
-| `WASMTIME_HTTP_PROXY_SERVER_MODE` | `auto` | HTTP server mode: `http1`, `http2` / `h2`, or `auto`. Setting `http2` also enables h2c for outgoing requests (gRPC) |
+| `WASMTIME_HTTP_PROXY_SERVER_MODE` | `auto` | HTTP server mode: `http1`, `http2` / `h2`, or `auto`. Controls the incoming connection protocol |
+| `WASMTIME_HTTP_PROXY_OUTGOING_H2C` | `false` | Use HTTP/2 prior-knowledge (h2c) for outgoing plaintext requests (`true`, `1`, or `yes`). Enable only when backends require HTTP/2 |
 | `WASMTIME_HTTP_PROXY_ALLOW_NETWORK` | `false` | Allow guest components to make outgoing network connections (`true`, `1`, or `yes` to enable) |
 | `WASMTIME_EPOCH_TIMEOUT_MS` | `30000` | Per-request epoch deadline in milliseconds. Controls how often a long-running guest yields back to the async runtime |
 

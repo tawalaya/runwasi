@@ -21,17 +21,24 @@ use hyper_util::rt::TokioExecutor;
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio::time::timeout;
+use wasmtime_wasi::runtime::AbortOnDropJoinHandle;
 use wasmtime_wasi_http::bindings::http::types as wasi_http_types;
 use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::types::{HostFutureIncomingResponse, IncomingResponse, OutgoingRequestConfig};
 use wasmtime_wasi_http::hyper_request_error;
 
-/// Global connection pool: maps authority (host:port) → reusable HTTP/2 sender.
-///
-/// HTTP/2 `SendRequest` handles are cheaply cloneable and allow multiplexing
-/// many concurrent requests over a single connection.
-static H2_POOL: LazyLock<Mutex<HashMap<String, SendRequest<HyperOutgoingBody>>>> =
+/// A pooled HTTP/2 connection: the sender for multiplexing requests and the
+/// background driver task that actually reads/writes on the TCP socket.
+/// The driver handle MUST be kept alive — dropping it aborts the task and
+/// kills the connection (`AbortOnDropJoinHandle`).
+struct PooledConnection {
+    sender: SendRequest<HyperOutgoingBody>,
+    _driver: AbortOnDropJoinHandle<()>,
+}
+
+/// Global connection pool: maps authority (host:port) → reusable HTTP/2 connection.
+static H2_POOL: LazyLock<Mutex<HashMap<String, PooledConnection>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Establish (or reuse) an h2c connection to `authority` and return a cloned sender.
@@ -42,21 +49,27 @@ async fn get_or_connect_h2(
     // Fast path: reuse an existing, still-ready connection.
     {
         let pool = H2_POOL.lock().await;
-        if let Some(sender) = pool.get(authority) {
-            if sender.is_ready() {
-                log::trace!("h2c pool: reusing connection to {authority}");
-                return Ok(sender.clone());
+        if let Some(entry) = pool.get(authority) {
+            if entry.sender.is_ready() {
+                log::info!("h2c pool: reusing connection to {authority}");
+                return Ok(entry.sender.clone());
             }
             // Connection is no longer usable; fall through to create a new one.
-            log::debug!("h2c pool: stale connection to {authority}, reconnecting");
+            log::info!("h2c pool: stale connection to {authority}, reconnecting");
         }
     }
 
     // Slow path: open a new TCP connection + HTTP/2 handshake.
+    log::info!("h2c pool: opening new TCP connection to {authority}");
     let tcp_stream = timeout(connect_timeout, TcpStream::connect(authority))
         .await
-        .map_err(|_| wasi_http_types::ErrorCode::ConnectionTimeout)?
-        .map_err(|e| match e.kind() {
+        .map_err(|_| {
+            log::error!("h2c: TCP connect timeout to {authority}");
+            wasi_http_types::ErrorCode::ConnectionTimeout
+        })?
+        .map_err(|e| {
+            log::error!("h2c: TCP connect error to {authority}: {e}");
+            match e.kind() {
             std::io::ErrorKind::AddrNotAvailable => {
                 wasi_http_types::ErrorCode::DnsError(wasi_http_types::DnsErrorPayload {
                     rcode: Some("address not available".to_string()),
@@ -75,35 +88,54 @@ async fn get_or_connect_h2(
                     wasi_http_types::ErrorCode::ConnectionRefused
                 }
             }
-        })?;
+        }})?;
+
+    log::info!("h2c: TCP connected to {authority} (peer={:?})", tcp_stream.peer_addr());
 
     // Disable Nagle's algorithm — critical for gRPC's small, latency-sensitive frames.
     tcp_stream.set_nodelay(true).ok();
 
     let stream = TokioIo::new(tcp_stream);
+    log::info!("h2c: starting HTTP/2 handshake to {authority}");
     let (sender, conn) = timeout(
         connect_timeout,
         hyper::client::conn::http2::handshake(TokioExecutor::new(), stream),
     )
     .await
-    .map_err(|_| wasi_http_types::ErrorCode::ConnectionTimeout)?
-    .map_err(hyper_request_error)?;
+    .map_err(|_| {
+        log::error!("h2c: HTTP/2 handshake timeout to {authority}");
+        wasi_http_types::ErrorCode::ConnectionTimeout
+    })?
+    .map_err(|e| {
+        log::error!("h2c: HTTP/2 handshake error to {authority}: {e:?}");
+        hyper_request_error(e)
+    })?;
+
+    log::info!("h2c: HTTP/2 handshake complete to {authority}");
 
     // Drive the connection in the background; clean up pool entry on close.
+    // IMPORTANT: The driver handle MUST be stored in the pool — dropping an
+    // AbortOnDropJoinHandle aborts the task, which would kill the connection.
     let key = authority.to_string();
-    wasmtime_wasi::runtime::spawn(async move {
-        if let Err(e) = conn.await {
-            log::warn!("h2c pool: connection to {key} closed with error: {e}");
-        } else {
-            log::debug!("h2c pool: connection to {key} closed cleanly");
+    let driver = wasmtime_wasi::runtime::spawn({
+        let key = key.clone();
+        async move {
+            if let Err(e) = conn.await {
+                log::warn!("h2c pool: connection to {key} closed with error: {e}");
+            } else {
+                log::info!("h2c pool: connection to {key} closed cleanly");
+            }
+            H2_POOL.lock().await.remove(&key);
         }
-        H2_POOL.lock().await.remove(&key);
     });
 
-    H2_POOL
-        .lock()
-        .await
-        .insert(authority.to_string(), sender.clone());
+    H2_POOL.lock().await.insert(
+        key,
+        PooledConnection {
+            sender: sender.clone(),
+            _driver: driver,
+        },
+    );
 
     log::debug!("h2c pool: new connection to {authority}");
     Ok(sender)
@@ -149,6 +181,8 @@ async fn h2c_send_request_handler(
     } else {
         return Err(wasi_http_types::ErrorCode::HttpRequestUriInvalid);
     };
+
+    log::info!("h2c_send_request_handler: authority={}, use_tls={}", authority, use_tls);
 
     // Strip scheme and authority from the URI — the HTTP packet should only
     // contain path+query when not addressing a proxy.
@@ -207,13 +241,29 @@ async fn h2c_send_request_handler(
         })
     } else {
         // HTTP/2 prior-knowledge (h2c) with connection pooling.
+        log::info!("h2c: getting/creating connection to {authority}");
         let mut sender = get_or_connect_h2(&authority, connect_timeout).await?;
+
+        log::info!(
+            "h2c: sending request to {authority}: method={}, uri={}, headers={:?}",
+            request.method(),
+            request.uri(),
+            request.headers().keys().map(|k| k.as_str()).collect::<Vec<_>>(),
+        );
 
         let resp = timeout(first_byte_timeout, sender.send_request(request))
             .await
-            .map_err(|_| wasi_http_types::ErrorCode::ConnectionReadTimeout)?
-            .map_err(hyper_request_error)?
+            .map_err(|_| {
+                log::error!("h2c: send_request timeout to {authority} (first_byte_timeout={first_byte_timeout:?})");
+                wasi_http_types::ErrorCode::ConnectionReadTimeout
+            })?
+            .map_err(|e| {
+                log::error!("h2c: send_request error to {authority}: {e:?}");
+                hyper_request_error(e)
+            })?
             .map(|body| body.map_err(hyper_request_error).boxed());
+
+        log::info!("h2c: got response from {authority}: status={}", resp.status());
 
         // No per-request worker needed — the pool's background task drives the connection.
         Ok(IncomingResponse {
