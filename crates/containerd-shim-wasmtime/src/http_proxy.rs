@@ -17,13 +17,12 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use wasmtime::Store;
 use wasmtime::component::ResourceTable;
-use wasmtime_wasi_http::bindings::ProxyPre;
 use wasmtime_wasi_http::bindings::http::types::Scheme;
 use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
-use crate::instance::{WasiPreview2Ctx, envs_from_ctx, epoch_deadline_from_env, default_store_limits};
+use crate::instance::{WasiPreview2Ctx, ServicePre, envs_from_ctx, epoch_deadline_from_env, default_store_limits};
 
 const DEFAULT_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 8080);
@@ -72,7 +71,7 @@ async fn tcp_accept(listener: &TcpListener) -> Option<TcpStream> {
 
 pub(crate) async fn serve_conn(
     ctx: &impl RuntimeContext,
-    instance: ProxyPre<WasiPreview2Ctx>,
+    instance: ServicePre<WasiPreview2Ctx>,
     cancel: CancellationToken,
 ) -> Result<()> {
     let mut env = envs_from_ctx(ctx).into_iter().collect::<HashMap<_, _>>();
@@ -202,7 +201,7 @@ pub(crate) async fn serve_conn(
 }
 
 struct ProxyHandler {
-    instance_pre: ProxyPre<WasiPreview2Ctx>,
+    instance_pre: ServicePre<WasiPreview2Ctx>,
     next_id: AtomicU64,
     env: Vec<(String, String)>,
     tracker: TaskTracker,
@@ -216,7 +215,7 @@ struct ProxyHandler {
 
 impl ProxyHandler {
     fn new(
-        instance_pre: ProxyPre<WasiPreview2Ctx>,
+        instance_pre: ServicePre<WasiPreview2Ctx>,
         env: Vec<(String, String)>,
         tracker: TaskTracker,
         outgoing_h2c: bool,

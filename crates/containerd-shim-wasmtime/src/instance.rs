@@ -17,12 +17,25 @@ use wasmtime::component::{self, Component, ResourceTable};
 use wasmtime::{Config, Module, Precompiled, StoreLimits, StoreLimitsBuilder, Store};
 use wasmtime_wasi::p2::{self as wasi_preview2};
 use wasmtime_wasi::preview1::{self as wasi_preview1};
-use wasmtime_wasi_http::bindings::ProxyPre;
 use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
 use wasmtime_wasi_http::{HttpResult, WasiHttpCtx, WasiHttpView};
 
 use crate::h2c::h2c_send_request;
+
+wasmtime::component::bindgen!({
+    world: "service",
+    path: "wit",
+    async: {
+        only_imports: ["nonexistent"],
+    },
+    with: {
+        "wasi:http": wasmtime_wasi_http::bindings::http,
+        "wasi": wasmtime_wasi::bindings,
+    },
+    trappable_imports: true,
+    require_store_data_send: true,
+});
 
 use crate::http_proxy::serve_conn;
 
@@ -358,7 +371,7 @@ impl WasmtimeSandbox {
 
                 let pre = linker.instantiate_pre(&component)?;
                 log::info!("pre-instantiate_pre");
-                let instance = ProxyPre::new(pre)?;
+                let instance = ServicePre::new(pre)?;
 
                 log::info!("starting HTTP server");
                 let cancel = self.cancel.clone();
