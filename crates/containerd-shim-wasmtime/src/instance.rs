@@ -31,7 +31,7 @@ wasmtime::component::bindgen!({
     },
     with: {
         "wasi:http": wasmtime_wasi_http::bindings::http,
-        "wasi": wasmtime_wasi::bindings,
+        "wasi": wasmtime_wasi::p2::bindings,
     },
     trappable_imports: true,
     require_store_data_send: true,
