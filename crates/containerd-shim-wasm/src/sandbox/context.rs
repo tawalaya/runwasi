@@ -19,6 +19,14 @@ pub trait RuntimeContext: Send + Sync {
     /// Returns environment variables in the format `ENV_VAR_NAME=VALUE` from the runtime spec process field.
     fn envs(&self) -> &[String];
 
+    /// Returns the host-side source path of the `/etc/resolv.conf` bind mount from the OCI
+    /// runtime spec, if present. The shim can use this path to apply the pod's DNS configuration
+    /// (nameservers and search domains injected by kubelet) to its own process so that
+    /// `getaddrinfo()` resolves Kubernetes service names correctly.
+    fn resolv_conf_source(&self) -> Option<std::path::PathBuf> {
+        None
+    }
+
     /// Returns a `Entrypoint` with the following fields obtained from the first argument in the OCI spec for entrypoint:
     ///   - `arg0` - raw entrypoint from the OCI spec
     ///   - `name` - provided as the file name of the module in the entrypoint without the extension
@@ -109,6 +117,15 @@ impl RuntimeContext for WasiContext<'_> {
             .and_then(|p| p.env().as_ref())
             .map(|a| a.as_slice())
             .unwrap_or_default()
+    }
+
+    fn resolv_conf_source(&self) -> Option<std::path::PathBuf> {
+        self.spec
+            .mounts()
+            .iter()
+            .flat_map(|mounts| mounts.iter())
+            .find(|m| m.destination() == std::path::Path::new("/etc/resolv.conf"))
+            .and_then(|m| m.source().clone())
     }
 
     fn entrypoint(&self) -> Entrypoint {

@@ -4,6 +4,7 @@ version = "0.6.0"
 edition.workspace = true
 
 [dependencies]
+nix = { workspace = true, features = ["sched", "mount"] }
 anyhow = { workspace = true }
 containerd-shim-wasm = { workspace = true, features = ["opentelemetry"] }
 libc = { workspace = true }

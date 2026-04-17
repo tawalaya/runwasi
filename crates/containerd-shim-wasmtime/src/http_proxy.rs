@@ -24,6 +24,56 @@ use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 use crate::instance::{WasiPreview2Ctx, ServicePre, envs_from_ctx, epoch_deadline_from_env, default_store_limits};
 
+/// On Linux, enters a private mount namespace and bind-mounts the pod's
+/// `/etc/resolv.conf` (injected by kubelet as an OCI spec mount) over the
+/// shim process's `/etc/resolv.conf`.  This ensures libc's `getaddrinfo()`
+/// uses kube-dns and the pod's search domains instead of the host resolver,
+/// enabling WASI `ip-name-lookup` to resolve Kubernetes service names.
+///
+/// Failures are non-fatal — a warning is logged and the shim continues with
+/// the host resolver (ClusterIP env-var addresses still work without DNS).
+#[cfg(target_os = "linux")]
+fn apply_pod_resolv_conf(ctx: &impl RuntimeContext) {
+    use nix::mount::{MsFlags, mount};
+    use nix::sched::{CloneFlags, unshare};
+
+    let source = match ctx.resolv_conf_source() {
+        Some(p) => p,
+        None => {
+            log::warn!("[dns] /etc/resolv.conf mount not found in OCI spec — using host resolver");
+            return;
+        }
+    };
+
+    if !source.exists() {
+        log::warn!("[dns] pod resolv.conf source {source:?} does not exist — using host resolver");
+        return;
+    }
+
+    // Detach from the shared mount namespace so the bind-mount only affects
+    // this shim process and doesn't modify the host filesystem.
+    if let Err(e) = unshare(CloneFlags::CLONE_NEWNS) {
+        log::warn!("[dns] unshare(CLONE_NEWNS) failed: {e} — using host resolver");
+        return;
+    }
+
+    if let Err(e) = mount(
+        Some(&source),
+        "/etc/resolv.conf",
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    ) {
+        log::warn!("[dns] bind-mount of {source:?} -> /etc/resolv.conf failed: {e} — using host resolver");
+        return;
+    }
+
+    log::info!("[dns] applied pod resolv.conf from {source:?}");
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_pod_resolv_conf(_ctx: &impl RuntimeContext) {}
+
 const DEFAULT_ADDR: SocketAddr =
     SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::new(0, 0, 0, 0)), 8080);
 
@@ -74,6 +124,10 @@ pub(crate) async fn serve_conn(
     instance: ServicePre<WasiPreview2Ctx>,
     cancel: CancellationToken,
 ) -> Result<()> {
+    // Apply the pod's resolv.conf so that WASI ip-name-lookup (getaddrinfo)
+    // uses kube-dns and pod search domains instead of the host resolver.
+    apply_pod_resolv_conf(ctx);
+
     let mut env = envs_from_ctx(ctx).into_iter().collect::<HashMap<_, _>>();
 
     // Consume env variables for Proxy server settings before passing it to handler
