@@ -295,6 +295,14 @@ impl ProxyHandler {
         builder.env("REQUEST_ID", req_id.to_string());
         // Expose guest stdout/stderr so diagnostic logs reach containerd (#4).
         builder.inherit_stdio();
+        // Pre-open /tmp so WASM components can use std::fs for scratch I/O.
+        // Without this the HttpProxy path has no preopened directories at all,
+        // causing std::fs calls to return ENOENT (WASI errno 44).
+        let file_perms = wasmtime_wasi::FilePerms::all();
+        let dir_perms  = wasmtime_wasi::DirPerms::all();
+        if let Err(e) = builder.preopened_dir("/tmp", "/tmp", dir_perms, file_perms) {
+            log::warn!("could not preopen /tmp for request {req_id}: {e} - IO stressor will be unavailable");
+        }
         // Only grant network access when WASMTIME_HTTP_PROXY_ALLOW_NETWORK is set (#5).
         if self.allow_network {
             builder.inherit_network();
