@@ -533,8 +533,7 @@ fn wasi_builder(ctx: &impl RuntimeContext) -> Result<wasi_preview2::WasiCtxBuild
         .allow_tcp(true)
         .allow_udp(true)
         .allow_ip_name_lookup(true)
-        //XXX: this is a bit to open no?
-        .preopened_dir("/", "/", dir_perms, file_perms)?;
+        .preopened_dir("/tmp", "/tmp",  dir_perms, file_perms)?;
 
     log::debug!("WASI context built successfully");
     Ok(builder)
