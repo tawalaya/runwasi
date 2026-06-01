@@ -13,6 +13,7 @@ use hyper::server::conn::{http1, http2};
 use hyper_util::rt::TokioExecutor;
 use hyper_util::server::conn::auto::Builder as AutoServerBuilder;
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use wasmtime::Store;
@@ -22,7 +23,7 @@ use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
-use crate::instance::{WasiPreview2Ctx, ServicePre, envs_from_ctx, epoch_deadline_from_env, default_store_limits};
+use crate::instance::{WasiPreview2Ctx, ServicePre, envs_from_ctx, epoch_deadline_from_env, default_store_limits, DEFAULT_MAX_MEMORY_SIZE};
 
 /// On Linux, enters a private mount namespace and bind-mounts the pod's
 /// `/etc/resolv.conf` (injected by kubelet as an OCI spec mount) over the
@@ -79,7 +80,61 @@ const DEFAULT_ADDR: SocketAddr =
 
 const DEFAULT_BACKLOG: u32 = 100;
 
+/// Default wall-clock per-request timeout (ms). Override via
+/// `WASMTIME_HTTP_PROXY_REQUEST_TIMEOUT_MS`.
+const DEFAULT_REQUEST_TIMEOUT_MS: u64 = 30_000;
+
+/// Fallback concurrency cap when the cgroup memory limit is unknown.
+const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 20;
+
+/// Fraction of the cgroup memory limit budgeted for guest instances when
+/// deriving the concurrency cap (the rest is headroom for host/runtime).
+const MEMORY_BUDGET_FRACTION: f64 = 0.8;
+
 type Request = hyper::Request<hyper::body::Incoming>;
+
+/// Best-effort read of this process's cgroup memory limit in bytes.
+///
+/// The runwasi shim process is placed in the pod's cgroup by containerd, so this
+/// reflects the pod/container memory limit. Returns `None` when unlimited or
+/// unreadable (non-Linux, no cgroup, or "max").
+fn cgroup_memory_limit_bytes() -> Option<u64> {
+    // cgroup v2 (unified hierarchy).
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory.max") {
+        let s = s.trim();
+        if s != "max" {
+            if let Ok(v) = s.parse::<u64>() {
+                return Some(v);
+            }
+        }
+    }
+    // cgroup v1.
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/memory/memory.limit_in_bytes") {
+        if let Ok(v) = s.trim().parse::<u64>() {
+            // v1 reports a near-i64::MAX sentinel when unlimited.
+            if v < i64::MAX as u64 / 2 {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+/// Resolve the maximum number of concurrent in-flight Wasm instances.
+///
+/// Priority: explicit override → derive from cgroup memory limit
+/// (`budget × limit / per-instance cap`) → fallback constant. Always ≥ 1.
+fn resolve_max_concurrent(override_value: Option<usize>) -> usize {
+    if let Some(v) = override_value {
+        return v.max(1);
+    }
+    if let Some(limit) = cgroup_memory_limit_bytes() {
+        let usable = (limit as f64 * MEMORY_BUDGET_FRACTION) as u64;
+        let n = usable / DEFAULT_MAX_MEMORY_SIZE as u64;
+        return (n as usize).max(1);
+    }
+    DEFAULT_MAX_CONCURRENT_REQUESTS
+}
 
 fn is_connection_error(e: &std::io::Error) -> bool {
     matches!(
@@ -140,6 +195,23 @@ pub(crate) async fn serve_conn(
         .and_then(|v| v.parse().ok())
         .unwrap_or(DEFAULT_BACKLOG);
 
+    // Wall-clock per-request timeout. Epoch interruption only preempts CPU-bound
+    // guests; a guest suspended in a host call (socket connect/read) never trips
+    // it, so without this a hung request pins its Wasm instance's memory forever.
+    let request_timeout = Duration::from_millis(
+        env.remove("WASMTIME_HTTP_PROXY_REQUEST_TIMEOUT_MS")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_REQUEST_TIMEOUT_MS),
+    );
+
+    // Cap on concurrent in-flight Wasm instances. Each instance can grow to the
+    // per-store memory limit, so bounding the count bounds worst-case RSS below
+    // the cgroup budget. Explicit override wins; otherwise derive from cgroup.
+    let max_concurrent_override = env
+        .remove("WASMTIME_HTTP_PROXY_MAX_CONCURRENT_REQUESTS")
+        .and_then(|v| v.parse().ok());
+    let max_concurrent = resolve_max_concurrent(max_concurrent_override);
+
     let socket = match addr {
         SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
         SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
@@ -188,9 +260,13 @@ pub(crate) async fn serve_conn(
 
     let env: Vec<(String, String)> = env.into_iter().collect();
     let epoch_deadline = epoch_deadline_from_env(&env);
-    let handler = Arc::new(ProxyHandler::new(instance, env, tracker.clone(), outgoing_h2c, epoch_deadline, allow_network));
+    let semaphore = Arc::new(Semaphore::new(max_concurrent));
+    let handler = Arc::new(ProxyHandler::new(instance, env, tracker.clone(), outgoing_h2c, epoch_deadline, allow_network, request_timeout, semaphore));
 
-    log::info!("Serving HTTP on http://{} (mode: {:?})", listener.local_addr()?, mode);
+    log::info!(
+        "Serving HTTP on http://{} (mode: {:?}, max_concurrent: {}, request_timeout: {:?})",
+        listener.local_addr()?, mode, max_concurrent, request_timeout
+    );
 
     // Pre-build connection handlers outside the loop to avoid per-connection allocations (#7).
     let http1_builder = {
@@ -265,9 +341,14 @@ struct ProxyHandler {
     epoch_deadline: u64,
     /// Whether the guest is allowed to make outgoing network connections.
     allow_network: bool,
+    /// Wall-clock timeout applied to each guest invocation.
+    request_timeout: Duration,
+    /// Bounds the number of concurrently instantiated guests (and thus RSS).
+    semaphore: Arc<Semaphore>,
 }
 
 impl ProxyHandler {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         instance_pre: ServicePre<WasiPreview2Ctx>,
         env: Vec<(String, String)>,
@@ -275,6 +356,8 @@ impl ProxyHandler {
         outgoing_h2c: bool,
         epoch_deadline: u64,
         allow_network: bool,
+        request_timeout: Duration,
+        semaphore: Arc<Semaphore>,
     ) -> Self {
         ProxyHandler {
             instance_pre,
@@ -284,6 +367,8 @@ impl ProxyHandler {
             outgoing_h2c,
             epoch_deadline,
             allow_network,
+            request_timeout,
+            semaphore,
         }
     }
 
@@ -331,6 +416,17 @@ impl ProxyHandler {
         self: Arc<Self>,
         req: Request,
     ) -> Result<hyper::Response<HyperOutgoingBody>> {
+        // Acquire a permit before building the instance so we never hold more
+        // live Wasm instances than the memory budget allows. The permit is moved
+        // into the guest task below and released only when the instance is fully
+        // dropped (normal completion or abort), bounding worst-case RSS.
+        let permit = self
+            .semaphore
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("semaphore is never closed");
+
         let (sender, receiver) = tokio::sync::oneshot::channel();
 
         let req_id = self.next_req_id();
@@ -348,6 +444,9 @@ impl ProxyHandler {
         let proxy = self.instance_pre.instantiate_async(&mut store).await?;
 
         let task = self.tracker.spawn(async move {
+            // Hold the permit for the full guest lifetime; dropped here on
+            // completion or when the task is aborted on timeout.
+            let _permit = permit;
             if let Err(e) = proxy
                 .wasi_http_incoming_handler()
                 .call_handle(store, req, out)
@@ -360,10 +459,10 @@ impl ProxyHandler {
             Ok(())
         });
 
-        match receiver.await {
-            Ok(Ok(resp)) => Ok(resp),
-            Ok(Err(e)) => Err(e.into()),
-            Err(_) => {
+        match tokio::time::timeout(self.request_timeout, receiver).await {
+            Ok(Ok(Ok(resp))) => Ok(resp),
+            Ok(Ok(Err(e))) => Err(e.into()),
+            Ok(Err(_)) => {
                 // An error in the receiver (`RecvError`) only indicates that the
                 // task exited before a response was sent (i.e., the sender was
                 // dropped); it does not describe the underlying cause of failure.
@@ -379,6 +478,14 @@ impl ProxyHandler {
                 };
 
                 bail!("guest never invoked `response-outparam::set` method: {e:?}")
+            }
+            Err(_elapsed) => {
+                // Wall-clock timeout: abort the guest task so its Store — and the
+                // instance's linear memory — is dropped and the permit released,
+                // instead of a hung guest pinning memory until OOM.
+                task.abort();
+                log::error!("[{req_id}] :: request timed out after {:?}", self.request_timeout);
+                bail!("request {req_id} timed out after {:?}", self.request_timeout)
             }
         }
     }

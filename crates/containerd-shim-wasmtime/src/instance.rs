@@ -76,7 +76,7 @@ pub struct WasmtimeCompiler(wasmtime::Engine);
 
 /// Default per-instance Wasm linear memory limit (128 MiB).
 /// Override via `WASMTIME_MAX_MEMORY_SIZE` env var (bytes).
-const DEFAULT_MAX_MEMORY_SIZE: usize = 128 * 1024 * 1024;
+pub(crate) const DEFAULT_MAX_MEMORY_SIZE: usize = 128 * 1024 * 1024;
 
 /// Default epoch-tick interval for the background ticker (10 ms).
 const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(10);
