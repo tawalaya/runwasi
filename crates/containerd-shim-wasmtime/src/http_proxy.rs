@@ -23,7 +23,7 @@ use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
-use crate::instance::{WasiPreview2Ctx, ServicePre, envs_from_ctx, epoch_deadline_from_env, default_store_limits, DEFAULT_MAX_MEMORY_SIZE};
+use crate::instance::{WasiPreview2Ctx, ServicePre, envs_from_ctx, epoch_deadline_from_env, default_store_limits, max_memory_size};
 
 /// On Linux, enters a private mount namespace and bind-mounts the pod's
 /// `/etc/resolv.conf` (injected by kubelet as an OCI spec mount) over the
@@ -130,7 +130,7 @@ fn resolve_max_concurrent(override_value: Option<usize>) -> usize {
     }
     if let Some(limit) = cgroup_memory_limit_bytes() {
         let usable = (limit as f64 * MEMORY_BUDGET_FRACTION) as u64;
-        let n = usable / DEFAULT_MAX_MEMORY_SIZE as u64;
+        let n = usable / max_memory_size() as u64;
         return (n as usize).max(1);
     }
     DEFAULT_MAX_CONCURRENT_REQUESTS

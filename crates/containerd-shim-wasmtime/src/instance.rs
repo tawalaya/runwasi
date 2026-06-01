@@ -74,9 +74,26 @@ pub struct WasmtimeShim;
 
 pub struct WasmtimeCompiler(wasmtime::Engine);
 
-/// Default per-instance Wasm linear memory limit (128 MiB).
-/// Override via `WASMTIME_MAX_MEMORY_SIZE` env var (bytes).
-pub(crate) const DEFAULT_MAX_MEMORY_SIZE: usize = 128 * 1024 * 1024;
+/// Default per-instance Wasm linear memory limit (256 MiB).
+///
+/// Must exceed the largest guest working set: the synthetic `memory` stressor
+/// allocates up to 128 MiB *on top of* the module baseline (tonic/prost heap,
+/// stack, other stressors). At the old 128 MiB cap a `MEMORY_LEVEL=2` request
+/// grew linear memory past the limit, `memory.grow` failed, and the guest
+/// aborted — surfacing to the client as `RST_STREAM` / INTERNAL.
+/// Override via the `WASMTIME_MAX_MEMORY_SIZE` env var (bytes) on the shim.
+pub(crate) const DEFAULT_MAX_MEMORY_SIZE: usize = 256 * 1024 * 1024;
+
+/// Per-instance linear memory cap in bytes: `WASMTIME_MAX_MEMORY_SIZE` or the
+/// default. Used for both the pooling-allocator ceiling and the per-store
+/// limiter so the two never disagree.
+pub(crate) fn max_memory_size() -> usize {
+    std::env::var("WASMTIME_MAX_MEMORY_SIZE")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|&v| v > 0)
+        .unwrap_or(DEFAULT_MAX_MEMORY_SIZE)
+}
 
 /// Default epoch-tick interval for the background ticker (10 ms).
 const EPOCH_TICK_INTERVAL: Duration = Duration::from_millis(10);
@@ -107,7 +124,7 @@ impl Default for WasmtimeSandbox {
         if use_pooling_allocator_by_default() {
             let mut cfg = wasmtime::PoolingAllocationConfig::default();
             // Bound per-instance memory to match StoreLimits.
-            cfg.max_memory_size(DEFAULT_MAX_MEMORY_SIZE);
+            cfg.max_memory_size(max_memory_size());
             // Cap the total pools to reasonable values for a container workload.
             cfg.total_memories(200);
             cfg.total_tables(200);
@@ -171,7 +188,7 @@ impl WasiPreview2Ctx {
 /// misbehaving guest cannot OOM the entire shim process.
 pub(crate) fn default_store_limits() -> StoreLimits {
     StoreLimitsBuilder::new()
-        .memory_size(DEFAULT_MAX_MEMORY_SIZE)
+        .memory_size(max_memory_size())
         .instances(100)
         .tables(20)
         .memories(20)
