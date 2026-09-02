@@ -1,0 +1,22 @@
+# syntax=docker/dockerfile:1.4
+
+ARG TARGETPLATFORM=linux/amd64
+FROM --platform=$TARGETPLATFORM rust:1.86-bookworm
+
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      libseccomp-dev \
+      pkg-config \
+      protobuf-compiler && \
+    rm -rf /var/lib/apt/lists/*
+
+ENV PROTOC=/usr/bin/protoc \
+    CARGO_TERM_COLOR=always \
+    CARGO_NET_GIT_FETCH_WITH_CLI=true \
+    RUST_BACKTRACE=1
+
+WORKDIR /work
+
+CMD ["cargo", "test", "-p", "containerd-shim-wasmtime", "test_parse_server_mode", "--", "--nocapture"]
