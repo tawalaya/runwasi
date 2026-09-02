@@ -46,6 +46,9 @@ pub enum Framing {
     /// One message whose first 4 bytes are its total length (u32 LE, header
     /// included). MongoDB's wire protocol; also DRDA, FastCGI-ish framings.
     LengthPrefixed,
+    /// memcached text protocol: `VALUE` blocks with counted data, terminated by
+    /// `END\r\n` or by any single-line status reply (`STORED`, `ERROR`, ...).
+    Memcached,
 }
 
 impl Framing {
@@ -54,6 +57,7 @@ impl Framing {
             "resp" | "redis" => Some(Framing::Resp),
             "line" => Some(Framing::Line),
             "lengthprefixed" | "mongo" | "mongodb" => Some(Framing::LengthPrefixed),
+            "memcached" | "memcache" => Some(Framing::Memcached),
             _ => None,
         }
     }
@@ -127,7 +131,8 @@ impl RawTcpConfig {
     ///
     /// * `WASMTIME_RAWTCP_UPSTREAMS` = `authority=framing,authority=framing`
     ///   e.g. `redis-cart:6379=resp,mongodb-geo:27017=mongo`.
-    ///   Framings: `resp`/`redis`, `line`, `lengthprefixed`/`mongo`/`mongodb`.
+    ///   Framings: `resp`/`redis`, `line`, `lengthprefixed`/`mongo`/`mongodb`,
+    ///   `memcached`/`memcache`.
     /// * `WASMTIME_RAWTCP_{CONNECT_MS,WRITE_MS,FIRST_BYTE_MS,BETWEEN_BYTES_MS,
     ///   MAX_LIFETIME_MS,KEEPALIVE_MS,KEEPALIVE_INTERVAL_MS,MAX_IDLE_PER_HOST}`
     pub fn from_env(env: &mut HashMap<String, String>) -> Self {
@@ -392,6 +397,37 @@ fn scan_reply(framing: Framing, buf: &[u8]) -> Scan {
             }
             None => Scan::Incomplete,
         },
+        Framing::Memcached => memcached_reply(buf),
+    }
+}
+
+/// One memcached text reply. A retrieval reply is a run of
+/// `VALUE <key> <flags> <bytes>[ <cas>]\r\n<bytes data>\r\n` blocks closed by
+/// `END\r\n`; every other first line (`STORED`, `NOT_FOUND`, `ERROR`,
+/// `CLIENT_ERROR ...`, ...) is a complete one-line reply. The counted data is
+/// skipped rather than scanned, so a value containing `END\r\n` is safe.
+fn memcached_reply(buf: &[u8]) -> Scan {
+    let mut pos = 0usize;
+    loop {
+        let Some(line_end) = crlf_end(buf, pos) else {
+            return Scan::Incomplete;
+        };
+        if !buf[pos..line_end].starts_with(b"VALUE ") {
+            return Scan::Complete(line_end); // END, STORED, ERROR, ...
+        }
+        // VALUE <key> <flags> <bytes> [<cas>]
+        let n = match buf[pos..line_end - 2]
+            .split(|&b| b == b' ')
+            .nth(3)
+            .and_then(parse_int)
+        {
+            Some(n) if n >= 0 => n as usize,
+            _ => return Scan::Invalid("bad VALUE data length".into()),
+        };
+        pos = line_end + n + 2; // data + its trailing CRLF
+        if buf.len() < pos {
+            return Scan::Incomplete;
+        }
     }
 }
 
@@ -580,6 +616,58 @@ mod tests {
         assert_eq!(lp(b"\x08\x00\x00\x00abcd\x08\x00\x00\x00xy"), Scan::Complete(8));
     }
 
+    fn mc(buf: &[u8]) -> Scan {
+        scan_reply(Framing::Memcached, buf)
+    }
+
+    #[test]
+    fn memcached_multi_value_get() {
+        let b = b"VALUE 1 0 3\r\nabc\r\nVALUE 2 0 1\r\nx\r\nEND\r\n";
+        assert_eq!(mc(b), Scan::Complete(b.len()));
+    }
+
+    #[test]
+    fn memcached_empty_get() {
+        assert_eq!(mc(b"END\r\n"), Scan::Complete(5));
+    }
+
+    #[test]
+    fn memcached_data_containing_end() {
+        // The value is literally "END\r\n" — counted, so it must not terminate.
+        let b = b"VALUE k 0 5\r\nEND\r\n\r\nEND\r\n";
+        assert_eq!(mc(b), Scan::Complete(b.len()));
+    }
+
+    #[test]
+    fn memcached_incomplete() {
+        assert_eq!(mc(b""), Scan::Incomplete);
+        assert_eq!(mc(b"VALUE k 0 5\r\nabc"), Scan::Incomplete);
+        assert_eq!(mc(b"VALUE k 0 3\r\nabc\r\n"), Scan::Incomplete); // no END yet
+        assert_eq!(mc(b"EN"), Scan::Incomplete);
+    }
+
+    #[test]
+    fn memcached_one_line_replies() {
+        assert_eq!(mc(b"STORED\r\n"), Scan::Complete(8));
+        assert_eq!(mc(b"NOT_STORED\r\n"), Scan::Complete(12));
+        assert_eq!(mc(b"CLIENT_ERROR bad command line format\r\n"), Scan::Complete(38));
+    }
+
+    #[test]
+    fn memcached_cas_field_and_trailing_after_one_reply() {
+        // `gets` adds a cas token after <bytes>; still field 3 that counts.
+        assert_eq!(mc(b"VALUE k 0 2 77\r\nhi\r\nEND\r\n"), Scan::Complete(25));
+        // A second reply already in the buffer stops at the first boundary.
+        assert_eq!(mc(b"STORED\r\nSTORED\r\n"), Scan::Complete(8));
+        assert_eq!(mc(b"END\r\nVALUE k 0 1\r\nx\r\nEND\r\n"), Scan::Complete(5));
+    }
+
+    #[test]
+    fn memcached_bad_length_is_invalid() {
+        assert!(matches!(mc(b"VALUE k 0 xx\r\n"), Scan::Invalid(_)));
+        assert!(matches!(mc(b"VALUE k 0\r\n"), Scan::Invalid(_)));
+    }
+
     #[test]
     fn framing_parse() {
         assert_eq!(Framing::parse("resp"), Some(Framing::Resp));
@@ -588,6 +676,8 @@ mod tests {
         assert_eq!(Framing::parse("mongo"), Some(Framing::LengthPrefixed));
         assert_eq!(Framing::parse("MongoDB"), Some(Framing::LengthPrefixed));
         assert_eq!(Framing::parse("lengthprefixed"), Some(Framing::LengthPrefixed));
+        assert_eq!(Framing::parse("memcached"), Some(Framing::Memcached));
+        assert_eq!(Framing::parse("Memcache"), Some(Framing::Memcached));
         assert_eq!(Framing::parse("nope"), None);
     }
 }
