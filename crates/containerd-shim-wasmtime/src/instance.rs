@@ -21,7 +21,7 @@ use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::types::{HostFutureIncomingResponse, OutgoingRequestConfig};
 use wasmtime_wasi_http::{HttpResult, WasiHttpCtx, WasiHttpView};
 
-use crate::h2c::h2c_send_request;
+use crate::outbound;
 
 wasmtime::component::bindgen!({
     world: "service",
@@ -164,9 +164,6 @@ pub struct WasiPreview2Ctx {
     pub(crate) resource_table: ResourceTable,
     /// Wasmtime resource limits (memory, tables, instances).
     pub(crate) store_limits: StoreLimits,
-    /// When true, outgoing plaintext HTTP requests use HTTP/2 prior-knowledge (h2c)
-    /// instead of HTTP/1.1. Required for gRPC communication.
-    pub(crate) outgoing_h2c: bool,
 }
 
 impl WasiPreview2Ctx {
@@ -177,7 +174,6 @@ impl WasiPreview2Ctx {
             wasi_http: WasiHttpCtx::new(),
             resource_table: ResourceTable::default(),
             store_limits: default_store_limits(),
-            outgoing_h2c: false,
         })
     }
 }
@@ -229,20 +225,69 @@ impl WasiHttpView for WasiPreview2Ctx {
         config: OutgoingRequestConfig,
     ) -> HttpResult<HostFutureIncomingResponse> {
         log::debug!(
-            "send_request: outgoing_h2c={}, method={}, uri={}, use_tls={}",
-            self.outgoing_h2c,
+            "send_request: method={}, uri={}, use_tls={}",
             request.method(),
             request.uri(),
             config.use_tls,
         );
-        if self.outgoing_h2c {
-            log::debug!("Using h2c (HTTP/2 prior-knowledge) for outgoing request");
-            Ok(h2c_send_request(request, config))
-        } else {
-            log::debug!("Using default_send_request (HTTP/1.1) for outgoing request");
-            Ok(wasmtime_wasi_http::types::default_send_request(request, config))
+        // Route through the outbound middleware registry. It consults the
+        // process-global OutboundConfig (installed from env at server startup)
+        // to pick a pooled middleware per target authority, or falls back to the
+        // default per-request HTTP/1.1 sender.
+        Ok(outbound::send_request(request, config))
+    }
+}
+
+/// Host-side mirror of the `pooled-tcp` WIT `tcp-error` variant, lowered to the
+/// guest. Defined here (not in `raw_tcp`) so that module stays WASI-free and
+/// natively testable.
+#[derive(wasmtime::component::ComponentType, wasmtime::component::Lower)]
+#[component(variant)]
+enum WitTcpError {
+    #[component(name = "unknown-upstream")]
+    UnknownUpstream(String),
+    #[component(name = "connect-failed")]
+    ConnectFailed(String),
+    #[component(name = "timeout")]
+    Timeout,
+    #[component(name = "protocol")]
+    Protocol(String),
+    #[component(name = "io")]
+    Io(String),
+}
+
+impl From<crate::raw_tcp::RawTcpError> for WitTcpError {
+    fn from(e: crate::raw_tcp::RawTcpError) -> Self {
+        use crate::raw_tcp::RawTcpError as E;
+        match e {
+            E::UnknownUpstream(s) => WitTcpError::UnknownUpstream(s),
+            E::Connect(s) => WitTcpError::ConnectFailed(s),
+            E::Timeout => WitTcpError::Timeout,
+            E::Protocol(s) => WitTcpError::Protocol(s),
+            E::Io(s) => WitTcpError::Io(s),
         }
     }
+}
+
+/// Wire the host implementation of `hybrid:microservices/pooled-tcp` into the
+/// component linker. Done manually (rather than via the bindgen world) so the
+/// shared `wit/world.wit` and host bindgen stay untouched; a guest importing the
+/// interface in its own world links to this by name + signature.
+fn add_pooled_tcp_to_linker(linker: &mut component::Linker<WasiPreview2Ctx>) -> Result<()> {
+    let mut iface = linker.instance("hybrid:microservices/pooled-tcp")?;
+    iface.func_wrap_async(
+        "request",
+        |_store: wasmtime::StoreContextMut<'_, WasiPreview2Ctx>,
+         (upstream, payload): (String, Vec<u8>)| {
+            Box::new(async move {
+                let result = crate::raw_tcp::request(&upstream, &payload)
+                    .await
+                    .map_err(WitTcpError::from);
+                Ok((result,))
+            })
+        },
+    )?;
+    Ok(())
 }
 
 impl Shim for WasmtimeShim {
@@ -385,6 +430,10 @@ impl WasmtimeSandbox {
                 let mut linker = component::Linker::new(&self.engine);
                 wasmtime_wasi::p2::add_to_linker_async(&mut linker)?;
                 wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
+                // Host-pooled raw-TCP request/reply (Redis/line). Manual linker
+                // wiring keeps the bindgen world untouched; satisfied for any
+                // guest that imports hybrid:microservices/pooled-tcp.
+                add_pooled_tcp_to_linker(&mut linker)?;
 
                 let pre = linker.instantiate_pre(&component)?;
                 log::info!("pre-instantiate_pre");
@@ -549,8 +598,18 @@ fn wasi_builder(ctx: &impl RuntimeContext) -> Result<wasi_preview2::WasiCtxBuild
         .inherit_network()
         .allow_tcp(true)
         .allow_udp(true)
-        .allow_ip_name_lookup(true)
-        .preopened_dir("/tmp", "/tmp",  dir_perms, file_perms)?;
+        .allow_ip_name_lookup(true);
+
+    // Pre-open /tmp for scratch I/O, but never fail the container over it. An
+    // image built by oci-tar-builder is a single wasm layer with no filesystem,
+    // so /tmp exists only when a volume happens to be mounted there. Propagating
+    // this error aborted run_wasi(), and the executor turns any Err into a
+    // hardcoded exit(137) — which reaches Kubernetes as a bare CrashLoopBackOff
+    // that reads like an OOM kill, with the real cause only in the node's
+    // containerd log. Same handling as the HttpProxy path in http_proxy.rs.
+    if let Err(e) = builder.preopened_dir("/tmp", "/tmp", dir_perms, file_perms) {
+        log::warn!("could not preopen /tmp: {e} - guest filesystem access will be unavailable");
+    }
 
     log::debug!("WASI context built successfully");
     Ok(builder)

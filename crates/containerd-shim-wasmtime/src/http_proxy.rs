@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use containerd_shim_wasm::sandbox::context::RuntimeContext;
 use hyper::server::conn::{http1, http2};
 use hyper_util::rt::TokioExecutor;
@@ -24,6 +24,8 @@ use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
 use crate::instance::{WasiPreview2Ctx, ServicePre, envs_from_ctx, epoch_deadline_from_env, default_store_limits, max_memory_size};
+use crate::outbound;
+use crate::raw_tcp;
 
 /// On Linux, enters a private mount namespace and bind-mounts the pod's
 /// `/etc/resolv.conf` (injected by kubelet as an OCI spec mount) over the
@@ -92,6 +94,22 @@ const DEFAULT_MAX_CONCURRENT_REQUESTS: usize = 20;
 const MEMORY_BUDGET_FRACTION: f64 = 0.8;
 
 type Request = hyper::Request<hyper::body::Incoming>;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerMode {
+    Http1,
+    Http2,
+    Auto,
+}
+
+fn parse_server_mode(mode: &str) -> ServerMode {
+    match mode.to_ascii_lowercase().as_str() {
+        "http1" => ServerMode::Http1,
+        "http2" | "h2" => ServerMode::Http2,
+        "auto" => ServerMode::Auto,
+        _ => ServerMode::Auto,
+    }
+}
 
 /// Best-effort read of this process's cgroup memory limit in bytes.
 ///
@@ -212,45 +230,28 @@ pub(crate) async fn serve_conn(
         .and_then(|v| v.parse().ok());
     let max_concurrent = resolve_max_concurrent(max_concurrent_override);
 
-    let socket = match addr {
-        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
-        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
-    };
-
-    // Conditionally enable `SO_REUSEADDR` depending on the current
-    // platform. On Unix we want this to be able to rebind an address in
-    // the `TIME_WAIT` state which can happen then a server is killed with
-    // active TCP connections and then restarted. On Windows though if
-    // `SO_REUSEADDR` is specified then it enables multiple applications to
-    // bind the port at the same time which is not something we want. Hence
-    // this is conditionally set based on the platform (and deviates from
-    // Tokio's default from always-on).
-    socket.set_reuseaddr(!cfg!(windows))?;
-    socket.bind(addr)?;
-
-    let listener = socket.listen(backlog)?;
     let tracker = TaskTracker::new();
 
     // Determine server mode via env: "http1", "http2"/"h2" or "auto" (default = "auto")
     let mode = env
         .remove("WASMTIME_HTTP_PROXY_SERVER_MODE")
         .unwrap_or_else(|| "auto".to_string());
-    #[derive(Debug, Clone, Copy)]
-    enum ServerMode { Http1, Http2, Auto }
-    let mode = match mode.to_ascii_lowercase().as_str() {
-        "http1" => ServerMode::Http1,
-        "http2" | "h2" => ServerMode::Http2,
-        "auto" => ServerMode::Auto,
-        _ => ServerMode::Auto,
-    };
+    let mode = parse_server_mode(&mode);
 
-    // Outgoing h2c is independent from the incoming server mode.
-    // Only enable when explicitly requested — the default upstream behavior (HTTP/1.1) is
-    // more compatible with the variety of backends a guest might call.
-    let outgoing_h2c = env
-        .remove("WASMTIME_HTTP_PROXY_OUTGOING_H2C")
-        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
-        .unwrap_or(false);
+    // Outbound connection policy (pooled h2c / http1 / default, per target) is
+    // parsed into a process-global config consumed by the outbound middleware
+    // registry. `from_env` consumes its own env keys (incl. the legacy
+    // WASMTIME_HTTP_PROXY_OUTGOING_H2C) so they are not forwarded to the guest.
+    outbound::init_config(outbound::OutboundConfig::from_env(&mut env));
+
+    // Raw-TCP (Redis/line) pooled-request config for the `pooled-tcp` WIT
+    // interface. Consumes its own env keys so they aren't forwarded to the guest.
+    raw_tcp::init_config(raw_tcp::RawTcpConfig::from_env(&mut env));
+
+    // Number of SO_REUSEPORT acceptor tasks. The kernel load-balances incoming
+    // connections across them, spreading accept + connection handling over
+    // cores. Defaults to the cgroup CPU budget (capped); override via env.
+    let acceptors = resolve_acceptors(&mut env);
 
     // Allow guest network access only when explicitly opted in (#5).
     let allow_network = env
@@ -261,14 +262,14 @@ pub(crate) async fn serve_conn(
     let env: Vec<(String, String)> = env.into_iter().collect();
     let epoch_deadline = epoch_deadline_from_env(&env);
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
-    let handler = Arc::new(ProxyHandler::new(instance, env, tracker.clone(), outgoing_h2c, epoch_deadline, allow_network, request_timeout, semaphore));
+    let handler = Arc::new(ProxyHandler::new(instance, env, tracker.clone(), epoch_deadline, allow_network, request_timeout, semaphore));
 
     log::info!(
-        "Serving HTTP on http://{} (mode: {:?}, max_concurrent: {}, request_timeout: {:?})",
-        listener.local_addr()?, mode, max_concurrent, request_timeout
+        "Serving HTTP on http://{} (mode: {:?}, acceptors: {}, max_concurrent: {}, request_timeout: {:?})",
+        addr, mode, acceptors, max_concurrent, request_timeout
     );
 
-    // Pre-build connection handlers outside the loop to avoid per-connection allocations (#7).
+    // Pre-build connection handlers once; cloned per acceptor / connection (#7).
     let http1_builder = {
         let mut b = http1::Builder::new();
         b.keep_alive(true);
@@ -283,6 +284,52 @@ pub(crate) async fn serve_conn(
     };
     let auto_builder = AutoServerBuilder::new(TokioExecutor::new());
 
+    // Spawn `acceptors` independent accept loops, each on its own SO_REUSEPORT
+    // socket bound to the same address. The kernel load-balances incoming
+    // connections across them, so accept + per-connection serving scale across
+    // cores instead of funneling through a single accept loop.
+    let mut acceptor_handles = Vec::with_capacity(acceptors);
+    for i in 0..acceptors {
+        let listener = bind_listener(addr, backlog, acceptors > 1)
+            .with_context(|| format!("acceptor {i} failed to bind {addr}"))?;
+        log::debug!("acceptor {i} listening on {}", listener.local_addr()?);
+        acceptor_handles.push(tokio::spawn(accept_loop(
+            listener,
+            handler.clone(),
+            mode,
+            http1_builder.clone(),
+            http2_builder.clone(),
+            auto_builder.clone(),
+            cancel.clone(),
+            tracker.clone(),
+        )));
+    }
+
+    // Wait for shutdown, then drain: acceptors stop on cancel; in-flight
+    // connections (and their guest tasks, tracked on `tracker`) then finish.
+    cancel.cancelled().await;
+    for handle in acceptor_handles {
+        let _ = handle.await;
+    }
+    tracker.close();
+    tracker.wait().await;
+
+    Ok(())
+}
+
+/// One accept loop. Owns a single (`SO_REUSEPORT`) listener and spawns a serving
+/// task per accepted connection onto the shared `tracker`. Exits on `cancel`.
+#[allow(clippy::too_many_arguments)]
+async fn accept_loop(
+    listener: TcpListener,
+    handler: Arc<ProxyHandler>,
+    mode: ServerMode,
+    http1_builder: http1::Builder,
+    http2_builder: http2::Builder<TokioExecutor>,
+    auto_builder: AutoServerBuilder<TokioExecutor>,
+    cancel: CancellationToken,
+    tracker: TaskTracker,
+) {
     loop {
         let stream = tokio::select! {
             conn = tcp_accept(&listener) => {
@@ -323,11 +370,78 @@ pub(crate) async fn serve_conn(
             }
         });
     }
+}
 
-    tracker.close();
-    tracker.wait().await;
+/// Bind a TCP listener, optionally with `SO_REUSEPORT` so multiple acceptors can
+/// share the same address and the kernel can spread connections across them.
+fn bind_listener(addr: SocketAddr, backlog: u32, reuseport: bool) -> Result<TcpListener> {
+    let socket = match addr {
+        SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => tokio::net::TcpSocket::new_v6()?,
+    };
 
-    Ok(())
+    // `SO_REUSEADDR`: rebind an address in `TIME_WAIT` after a restart with
+    // active connections. Off on Windows, where it would let other processes
+    // steal the port (deviates from Tokio's always-on default).
+    socket.set_reuseaddr(!cfg!(windows))?;
+
+    // `SO_REUSEPORT`: let every acceptor bind the same port; the kernel
+    // load-balances accepted connections across the listening sockets.
+    #[cfg(unix)]
+    if reuseport {
+        socket.set_reuseport(true)?;
+    }
+    #[cfg(not(unix))]
+    let _ = reuseport;
+
+    socket.bind(addr)?;
+    Ok(socket.listen(backlog)?)
+}
+
+/// Resolve the number of `SO_REUSEPORT` acceptor tasks. Explicit override wins;
+/// otherwise size to the cgroup CPU budget (capped), falling back to the host
+/// parallelism. Always ≥ 1.
+fn resolve_acceptors(env: &mut HashMap<String, String>) -> usize {
+    if let Some(n) = env
+        .remove("WASMTIME_HTTP_PROXY_ACCEPTORS")
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        return n.max(1);
+    }
+    let cpus = cgroup_cpu_limit()
+        .or_else(|| std::thread::available_parallelism().ok().map(|n| n.get()))
+        .unwrap_or(1);
+    cpus.clamp(1, 8)
+}
+
+/// Best-effort read of this process's cgroup CPU quota, rounded up to whole
+/// CPUs. Returns `None` when unlimited or unreadable.
+fn cgroup_cpu_limit() -> Option<usize> {
+    // cgroup v2: "<quota> <period>" or "max <period>".
+    if let Ok(s) = std::fs::read_to_string("/sys/fs/cgroup/cpu.max") {
+        let mut it = s.split_whitespace();
+        if let (Some(q), Some(p)) = (it.next(), it.next()) {
+            if q != "max" {
+                if let (Ok(q), Ok(p)) = (q.parse::<u64>(), p.parse::<u64>()) {
+                    if p > 0 {
+                        return Some((q.div_ceil(p) as usize).max(1));
+                    }
+                }
+            }
+        }
+    }
+    // cgroup v1.
+    if let (Ok(q), Ok(p)) = (
+        std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_quota_us"),
+        std::fs::read_to_string("/sys/fs/cgroup/cpu/cpu.cfs_period_us"),
+    ) {
+        if let (Ok(q), Ok(p)) = (q.trim().parse::<i64>(), p.trim().parse::<u64>()) {
+            if q > 0 && p > 0 {
+                return Some(((q as u64).div_ceil(p) as usize).max(1));
+            }
+        }
+    }
+    None
 }
 
 struct ProxyHandler {
@@ -335,8 +449,6 @@ struct ProxyHandler {
     next_id: AtomicU64,
     env: Vec<(String, String)>,
     tracker: TaskTracker,
-    /// When true, outgoing plaintext HTTP requests use HTTP/2 prior-knowledge (h2c).
-    outgoing_h2c: bool,
     /// Per-request epoch deadline in ticks.
     epoch_deadline: u64,
     /// Whether the guest is allowed to make outgoing network connections.
@@ -353,7 +465,6 @@ impl ProxyHandler {
         instance_pre: ServicePre<WasiPreview2Ctx>,
         env: Vec<(String, String)>,
         tracker: TaskTracker,
-        outgoing_h2c: bool,
         epoch_deadline: u64,
         allow_network: bool,
         request_timeout: Duration,
@@ -364,7 +475,6 @@ impl ProxyHandler {
             env,
             tracker,
             next_id: AtomicU64::from(0),
-            outgoing_h2c,
             epoch_deadline,
             allow_network,
             request_timeout,
@@ -401,7 +511,6 @@ impl ProxyHandler {
             wasi_http: WasiHttpCtx::new(),
             resource_table: ResourceTable::default(),
             store_limits: default_store_limits(),
-            outgoing_h2c: self.outgoing_h2c,
         };
 
         let mut store = Store::new(engine, ctx);
@@ -492,5 +601,31 @@ impl ProxyHandler {
 
     fn next_req_id(&self) -> u64 {
         self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ServerMode, parse_server_mode};
+
+    #[test]
+    fn test_parse_server_mode_http1() {
+        assert_eq!(parse_server_mode("http1"), ServerMode::Http1);
+        assert_eq!(parse_server_mode("HTTP1"), ServerMode::Http1);
+    }
+
+    #[test]
+    fn test_parse_server_mode_http2_and_h2_alias() {
+        assert_eq!(parse_server_mode("http2"), ServerMode::Http2);
+        assert_eq!(parse_server_mode("h2"), ServerMode::Http2);
+        assert_eq!(parse_server_mode("H2"), ServerMode::Http2);
+    }
+
+    #[test]
+    fn test_parse_server_mode_auto_and_default_fallback() {
+        assert_eq!(parse_server_mode("auto"), ServerMode::Auto);
+        assert_eq!(parse_server_mode("AUTO"), ServerMode::Auto);
+        assert_eq!(parse_server_mode("unknown"), ServerMode::Auto);
+        assert_eq!(parse_server_mode(""), ServerMode::Auto);
     }
 }

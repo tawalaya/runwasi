@@ -10,15 +10,17 @@ containerd-shim-wasm = { workspace = true, features = ["opentelemetry"] }
 libc = { workspace = true }
 log = { workspace = true }
 hyper = { workspace = true }
-tokio = { workspace = true, features = ["signal", "macros"] }
+tokio = { workspace = true, features = ["signal", "macros", "rt", "net", "time", "sync", "io-util"] }
 tokio-util = { workspace = true, features = ["rt"] }
+bytes = "1"
 
 wasmtime = { workspace = true }
 wasmtime-wasi = { workspace = true }
 wasmtime-wasi-http = { workspace = true }
-hyper-util = { workspace = true }
+hyper-util = { workspace = true, features = ["client-legacy", "http1", "tokio"] }
 http-body-util = "0.1"
 http = "1"
+socket2 = "0.5"
 
 [dev-dependencies]
 containerd-shim-wasm = { workspace = true, features = ["testing"] }
