@@ -43,6 +43,9 @@ pub enum Framing {
     Resp,
     /// One `\n`-terminated line.
     Line,
+    /// One message whose first 4 bytes are its total length (u32 LE, header
+    /// included). MongoDB's wire protocol; also DRDA, FastCGI-ish framings.
+    LengthPrefixed,
 }
 
 impl Framing {
@@ -50,6 +53,7 @@ impl Framing {
         match s.trim().to_ascii_lowercase().as_str() {
             "resp" | "redis" => Some(Framing::Resp),
             "line" => Some(Framing::Line),
+            "lengthprefixed" | "mongo" | "mongodb" => Some(Framing::LengthPrefixed),
             _ => None,
         }
     }
@@ -122,7 +126,8 @@ impl RawTcpConfig {
     /// Parse from the shim env map, consuming recognized keys.
     ///
     /// * `WASMTIME_RAWTCP_UPSTREAMS` = `authority=framing,authority=framing`
-    ///   e.g. `redis-cart:6379=resp`
+    ///   e.g. `redis-cart:6379=resp,mongodb-geo:27017=mongo`.
+    ///   Framings: `resp`/`redis`, `line`, `lengthprefixed`/`mongo`/`mongodb`.
     /// * `WASMTIME_RAWTCP_{CONNECT_MS,WRITE_MS,FIRST_BYTE_MS,BETWEEN_BYTES_MS,
     ///   MAX_LIFETIME_MS,KEEPALIVE_MS,KEEPALIVE_INTERVAL_MS,MAX_IDLE_PER_HOST}`
     pub fn from_env(env: &mut HashMap<String, String>) -> Self {
@@ -375,6 +380,18 @@ fn scan_reply(framing: Framing, buf: &[u8]) -> Scan {
             Some(end) => Scan::Complete(end),
             None => Scan::Incomplete,
         },
+        // First 4 bytes = total message length incl. header, little-endian.
+        Framing::LengthPrefixed => match buf.get(..4) {
+            Some(h) => {
+                let n = u32::from_le_bytes(h.try_into().unwrap()) as usize;
+                if buf.len() >= n {
+                    Scan::Complete(n)
+                } else {
+                    Scan::Incomplete
+                }
+            }
+            None => Scan::Incomplete,
+        },
     }
 }
 
@@ -534,11 +551,43 @@ mod tests {
         assert_eq!(scan_reply(Framing::Line, b"hello"), Scan::Incomplete);
     }
 
+    fn lp(buf: &[u8]) -> Scan {
+        scan_reply(Framing::LengthPrefixed, buf)
+    }
+
+    #[test]
+    fn length_prefixed_complete() {
+        // 8-byte message: len(4) + 4 payload bytes.
+        assert_eq!(lp(b"\x08\x00\x00\x00abcd"), Scan::Complete(8));
+        // Header-only message (len == 4).
+        assert_eq!(lp(b"\x04\x00\x00\x00"), Scan::Complete(4));
+    }
+
+    #[test]
+    fn length_prefixed_incomplete_header() {
+        assert_eq!(lp(b""), Scan::Incomplete);
+        assert_eq!(lp(b"\x08\x00\x00"), Scan::Incomplete);
+    }
+
+    #[test]
+    fn length_prefixed_incomplete_body() {
+        assert_eq!(lp(b"\x08\x00\x00\x00ab"), Scan::Incomplete);
+    }
+
+    #[test]
+    fn length_prefixed_trailing_after_one_reply_is_complete_at_first() {
+        // One 8-byte message followed by the start of another.
+        assert_eq!(lp(b"\x08\x00\x00\x00abcd\x08\x00\x00\x00xy"), Scan::Complete(8));
+    }
+
     #[test]
     fn framing_parse() {
         assert_eq!(Framing::parse("resp"), Some(Framing::Resp));
         assert_eq!(Framing::parse("REDIS"), Some(Framing::Resp));
         assert_eq!(Framing::parse("line"), Some(Framing::Line));
+        assert_eq!(Framing::parse("mongo"), Some(Framing::LengthPrefixed));
+        assert_eq!(Framing::parse("MongoDB"), Some(Framing::LengthPrefixed));
+        assert_eq!(Framing::parse("lengthprefixed"), Some(Framing::LengthPrefixed));
         assert_eq!(Framing::parse("nope"), None);
     }
 }
