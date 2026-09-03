@@ -3,8 +3,8 @@
 
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -23,7 +23,7 @@ use wasmtime_wasi_http::body::HyperOutgoingBody;
 use wasmtime_wasi_http::io::TokioIo;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 
-use crate::instance::{WasiPreview2Ctx, ServicePre, envs_from_ctx, epoch_deadline_from_env, default_store_limits, max_memory_size};
+use crate::instance::{WasiPreview2Ctx, Service, ServicePre, envs_from_ctx, epoch_deadline_from_env, default_store_limits, max_memory_size};
 use crate::outbound;
 use crate::raw_tcp;
 
@@ -230,6 +230,14 @@ pub(crate) async fn serve_conn(
         .and_then(|v| v.parse().ok());
     let max_concurrent = resolve_max_concurrent(max_concurrent_override);
 
+    // Keep instances alive across requests (a pool bounded by max_concurrent)
+    // instead of instantiating per request. For guests that hold state a
+    // long-lived process would build once, e.g. an in-memory index.
+    let reuse_instances = env
+        .remove("WASMTIME_HTTP_PROXY_INSTANCE_REUSE")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+
     let tracker = TaskTracker::new();
 
     // Determine server mode via env: "http1", "http2"/"h2" or "auto" (default = "auto")
@@ -262,11 +270,11 @@ pub(crate) async fn serve_conn(
     let env: Vec<(String, String)> = env.into_iter().collect();
     let epoch_deadline = epoch_deadline_from_env(&env);
     let semaphore = Arc::new(Semaphore::new(max_concurrent));
-    let handler = Arc::new(ProxyHandler::new(instance, env, tracker.clone(), epoch_deadline, allow_network, request_timeout, semaphore));
+    let handler = Arc::new(ProxyHandler::new(instance, env, tracker.clone(), epoch_deadline, allow_network, request_timeout, semaphore, reuse_instances));
 
     log::info!(
-        "Serving HTTP on http://{} (mode: {:?}, acceptors: {}, max_concurrent: {}, request_timeout: {:?})",
-        addr, mode, acceptors, max_concurrent, request_timeout
+        "Serving HTTP on http://{} (mode: {:?}, acceptors: {}, max_concurrent: {}, request_timeout: {:?}, instance_reuse: {})",
+        addr, mode, acceptors, max_concurrent, request_timeout, reuse_instances
     );
 
     // Pre-build connection handlers once; cloned per acceptor / connection (#7).
@@ -457,6 +465,8 @@ struct ProxyHandler {
     request_timeout: Duration,
     /// Bounds the number of concurrently instantiated guests (and thus RSS).
     semaphore: Arc<Semaphore>,
+    /// Idle instances kept for the next request; `None` = instantiate per request.
+    warm: Option<Mutex<Vec<(Store<WasiPreview2Ctx>, Service)>>>,
 }
 
 impl ProxyHandler {
@@ -469,6 +479,7 @@ impl ProxyHandler {
         allow_network: bool,
         request_timeout: Duration,
         semaphore: Arc<Semaphore>,
+        reuse_instances: bool,
     ) -> Self {
         ProxyHandler {
             instance_pre,
@@ -479,6 +490,25 @@ impl ProxyHandler {
             allow_network,
             request_timeout,
             semaphore,
+            warm: reuse_instances.then(|| Mutex::new(Vec::new())),
+        }
+    }
+
+    /// A warm instance if one is idle, else a fresh store and instance.
+    async fn checkout(&self, req_id: u64) -> Result<(Store<WasiPreview2Ctx>, Service)> {
+        if let Some(pair) = self.warm.as_ref().and_then(|w| w.lock().unwrap().pop()) {
+            return Ok(pair);
+        }
+        let mut store = self.wasi_store_for_request(req_id);
+        let proxy = self.instance_pre.instantiate_async(&mut store).await?;
+        Ok((store, proxy))
+    }
+
+    /// Back to the pool after a clean completion. A trapped, errored or timed
+    /// out instance never comes here and is dropped with its task.
+    fn checkin(&self, pair: (Store<WasiPreview2Ctx>, Service)) {
+        if let Some(w) = &self.warm {
+            w.lock().unwrap().push(pair);
         }
     }
 
@@ -546,24 +576,25 @@ impl ProxyHandler {
             req.uri()
         );
 
-        let mut store = self.wasi_store_for_request(req_id);
+        let (mut store, proxy) = self.checkout(req_id).await?;
 
         let req = store.data_mut().new_incoming_request(Scheme::Http, req)?;
         let out = store.data_mut().new_response_outparam(sender)?;
-        let proxy = self.instance_pre.instantiate_async(&mut store).await?;
 
+        let handler = self.clone();
         let task = self.tracker.spawn(async move {
             // Hold the permit for the full guest lifetime; dropped here on
             // completion or when the task is aborted on timeout.
             let _permit = permit;
             if let Err(e) = proxy
                 .wasi_http_incoming_handler()
-                .call_handle(store, req, out)
+                .call_handle(&mut store, req, out)
                 .await
             {
                 log::error!("[{req_id}] :: {:#?}", e);
                 return Err(e);
             }
+            handler.checkin((store, proxy));
 
             Ok(())
         });
