@@ -8,8 +8,13 @@ anyhow = { workspace = true }
 containerd-shim-wasm = { workspace = true, features = ["opentelemetry"] }
 libc = { workspace = true }
 log = { workspace = true }
-hyper = { workspace = true }
-tokio = { workspace = true, features = ["signal", "macros"] }
+hyper = { workspace = true, features = ["server", "client", "http1", "http2"] }
+hyper-util = { version = "0.1", features = ["server-auto", "client-legacy", "http1", "http2", "tokio"] }
+http = "1"
+http-body = "1"
+http-body-util = "0.1"
+bytes = "1"
+tokio = { workspace = true, features = ["signal", "macros", "net", "time", "rt"] }
 tokio-util = { workspace = true, features = ["rt"] }
 
 wasmtime = { workspace = true }
