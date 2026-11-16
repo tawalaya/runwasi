@@ -12,7 +12,7 @@ use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -86,11 +86,13 @@ struct OutboundTimeouts {
 
 impl OutboundTimeouts {
     /// The pooled client connects inside `request()`, so connect and first byte share one
-    /// deadline; the first-byte timeout is the longer of the two by meaning, so it wins.
+    /// deadline: their sum, as wasmtime's default_send_request spends them one after the
+    /// other. A connect timeout alone is not enforced: applied to the whole call it would
+    /// fail a healthy but slow downstream that upstream wasmtime serves.
     /// `between_bytes` is not enforced: response bodies stream after the hook returns and
     /// every guest here makes unary calls.
     fn request_deadline(&self) -> Option<Duration> {
-        self.first_byte.or(self.connect)
+        self.first_byte.map(|fb| fb + self.connect.unwrap_or_default())
     }
 }
 
@@ -219,6 +221,7 @@ struct Worker {
     reuse: usize,
     concurrency: usize,
     request_timeout: Duration,
+    live: Arc<AtomicUsize>,
 }
 
 impl WorkerState for Worker {
@@ -249,6 +252,7 @@ impl WorkerState for Worker {
             log::error!("worker failed: {e:?}");
         }
         drop(store);
+        self.live.fetch_sub(1, Relaxed);
     }
 }
 
@@ -262,6 +266,8 @@ struct State {
     concurrency: usize,
     request_timeout: Duration,
     limit: Option<Arc<Semaphore>>,
+    // live instances, logged at each start: the in-flight cap bounds them only indirectly
+    live: Arc<AtomicUsize>,
     next_instance: AtomicU64,
     next_request: AtomicU64,
 }
@@ -283,6 +289,8 @@ impl HandlerState for State {
         };
         let mut store = Store::new(&self.engine, host);
         let proxy = self.pre.instantiate_async(&mut store).await?;
+        let live = self.live.fetch_add(1, Relaxed) + 1;
+        log::info!("instance {id} started, {live} live");
         Ok(Instance {
             store,
             proxy,
@@ -296,6 +304,7 @@ impl HandlerState for State {
                 reuse: self.reuse,
                 concurrency: self.concurrency,
                 request_timeout: self.request_timeout,
+                live: self.live.clone(),
             },
         })
     }
@@ -307,22 +316,30 @@ fn env_usize(env: &HashMap<String, String>, name: &str, default: usize) -> usize
 
 const DEFAULT_INSTANCE_CONCURRENCY: usize = 16;
 
-/// `WASIHOST_MAX_INSTANCES` as a cap on in-flight requests: instances × per-instance concurrency.
+/// `WASIHOST_MAX_INSTANCES` sizes a cap on **in-flight requests**: MAX × per-instance
+/// concurrency. It is not a strict instance cap.
 ///
-/// Without a cap the handler starts another instance whenever every live one is at its
-/// concurrency, so a burst grows guest linear memory until the pod is OOMKilled (the P3
-/// pods at their failing step, September). The cap sits around `ProxyHandler::handle`, not
-/// in `instantiate`: a request handed to a new worker waits for that worker's instantiate,
-/// and with instance reuse unbounded a permit held by an instance is only released when it
-/// idles out (an hour), so a permit wait there strands the request. Capping requests bounds
-/// instances too, because a new worker starts only when all existing ones are full.
+/// Without it the handler starts another instance whenever no live one is available, so a
+/// burst grows guest linear memory until the pod is OOM-killed (the P3 pods at their failing
+/// step, September). The cap sits around `ProxyHandler::handle`, not in `instantiate`: a
+/// request handed to a new worker waits for that worker's instantiate, and with instance
+/// reuse unbounded a permit held by an instance is only released when it idles out (an
+/// hour), so a permit wait there strands the request.
+///
+/// Live instances are bounded by the permits, not by MAX: a worker also turns unavailable
+/// right after accepting a request until its guest task yields (wasmtime-wasi-http handler:
+/// one CPU-bound task per instance), so a CPU-heavy burst can start up to one instance per
+/// in-flight request. Queue time at the permit is not part of `WASIHOST_REQUEST_TIMEOUT_S`.
 fn instance_limit(env: &HashMap<String, String>) -> Option<Arc<Semaphore>> {
     let raw = env.get("WASIHOST_MAX_INSTANCES")?;
     match raw.parse::<usize>() {
         Ok(0) => None,
         Ok(max) => {
-            let per = env_usize(env, "WASIHOST_INSTANCE_CONCURRENCY", DEFAULT_INSTANCE_CONCURRENCY);
-            Some(Arc::new(Semaphore::new(max * per)))
+            // concurrency 0 would be a zero-permit semaphore (every request waits forever);
+            // an overflowing product would wrap or panic past Semaphore::MAX_PERMITS
+            let per = env_usize(env, "WASIHOST_INSTANCE_CONCURRENCY", DEFAULT_INSTANCE_CONCURRENCY).max(1);
+            let permits = max.checked_mul(per).unwrap_or(usize::MAX).min(Semaphore::MAX_PERMITS);
+            Some(Arc::new(Semaphore::new(permits)))
         }
         Err(_) => {
             log::warn!("WASIHOST_MAX_INSTANCES={raw:?} is not a number; instances stay unbounded");
@@ -336,7 +353,7 @@ async fn handle(
     req: hyper::Request<hyper::body::Incoming>,
 ) -> Result<hyper::Response<WasiBody>, std::convert::Infallible> {
     let id = handler.state().next_request.fetch_add(1, Relaxed);
-    // Held until the guest has produced the response; excess requests queue here.
+    // Held until the guest has produced the response head; excess requests queue here.
     let _permit = match &handler.state().limit {
         Some(limit) => Some(limit.clone().acquire_owned().await.expect("never closed")),
         None => None,
@@ -434,6 +451,7 @@ pub(crate) async fn serve_conn(
             env_usize(&env, "WASIHOST_REQUEST_TIMEOUT_S", 30) as u64,
         ),
         limit: instance_limit(&env),
+        live: Arc::new(AtomicUsize::new(0)),
         next_instance: AtomicU64::new(0),
         next_request: AtomicU64::new(0),
     };
@@ -481,7 +499,11 @@ pub(crate) async fn serve_conn(
 mod tests {
     use super::*;
     // Serial like the wasmtime_tests, which start sandboxed containers in this process: run
-    // alongside them, send_request_reports_refused_connections hung for over 60 s.
+    // alongside them, send_request_reports_refused_connections hung for over 60 s. Even
+    // serialised, the two send_request tests (real sockets, a pooled hyper client) made
+    // the wasmtime_tests http-proxy cases fail intermittently with "Server did not start
+    // in time" (bare port: 3/3 clean, with them: 1-2 failures in 2-3 runs, without them:
+    // 3/3 clean), so they are #[ignore]d here and run as their own process.
     use serial_test::serial;
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -515,6 +537,25 @@ mod tests {
 
     #[test]
     #[serial]
+    fn instance_limit_degenerate_sizes_never_hang_or_panic() {
+        // concurrency 0 would make a zero-permit semaphore: every request waits forever
+        let zero = instance_limit(&env(&[
+            ("WASIHOST_MAX_INSTANCES", "4"),
+            ("WASIHOST_INSTANCE_CONCURRENCY", "0"),
+        ]))
+        .unwrap();
+        assert_eq!(zero.available_permits(), 4);
+        // an overflowing product must clamp, not wrap to 0 or exceed Semaphore::MAX_PERMITS
+        let huge = instance_limit(&env(&[
+            ("WASIHOST_MAX_INSTANCES", &usize::MAX.to_string()),
+            ("WASIHOST_INSTANCE_CONCURRENCY", "16"),
+        ]))
+        .unwrap();
+        assert_eq!(huge.available_permits(), Semaphore::MAX_PERMITS);
+    }
+
+    #[test]
+    #[serial]
     fn instance_limit_garbage_is_unbounded() {
         assert!(instance_limit(&env(&[("WASIHOST_MAX_INSTANCES", "four")])).is_none());
     }
@@ -538,10 +579,12 @@ mod tests {
         assert_eq!(t.connect, Some(Duration::from_secs(2)));
         assert_eq!(t.first_byte, Some(Duration::from_secs(5)));
         assert_eq!(t.between_bytes, None);
-        // first byte includes connecting on a pooled client, so it is the deadline
-        assert_eq!(t.request_deadline(), Some(Duration::from_secs(5)));
+        // wasmtime's default_send_request spends connect, then first byte: the budgets add
+        assert_eq!(t.request_deadline(), Some(Duration::from_secs(7)));
+        // connect alone bounds connecting, never the response; a pooled client cannot time
+        // the connect step on its own, so it is not enforced rather than misapplied
         let only_connect = OutboundTimeouts { connect: Some(Duration::from_secs(2)), ..Default::default() };
-        assert_eq!(only_connect.request_deadline(), Some(Duration::from_secs(2)));
+        assert_eq!(only_connect.request_deadline(), None);
     }
 
     fn get(authority: &str) -> http::Request<WasiBody> {
@@ -553,6 +596,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[ignore = "own process: cargo test -p containerd-shim-wasmtime --lib send_request -- --ignored"]
     async fn send_request_times_out_on_a_silent_downstream() {
         // accepts, never answers: without the first-byte deadline the guest waits for the
         // shim's 30 s request timeout instead of seeing its own timeout
@@ -581,6 +625,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    #[ignore = "own process: cargo test -p containerd-shim-wasmtime --lib send_request -- --ignored"]
     async fn send_request_reports_refused_connections() {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap().to_string();
