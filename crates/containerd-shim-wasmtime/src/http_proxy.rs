@@ -25,7 +25,7 @@ use hyper_util::server::conn::auto::Builder as AutoBuilder;
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
-use wasmtime::component::{Component, GuestTaskId, Linker, ResourceTable};
+use wasmtime::component::{Component, TaskGroupId, Linker, ResourceTable};
 use wasmtime::{Engine, Store, StoreContextMut};
 use wasmtime_wasi::{WasiCtx, WasiCtxView, WasiView};
 use wasmtime_wasi_http::handler::{
@@ -193,7 +193,7 @@ impl WorkerState for Worker {
         &self,
         _store: StoreContextMut<'_, Host>,
         _request_id: u64,
-        _task: GuestTaskId,
+        _task: TaskGroupId,
     ) -> Pin<Box<dyn Future<Output = ()> + 'static + Send + Sync>> {
         Box::pin(tokio::time::sleep(self.request_timeout))
     }
