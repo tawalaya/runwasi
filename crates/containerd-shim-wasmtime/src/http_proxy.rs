@@ -5,7 +5,8 @@
 //! Pod env knobs: `PORT` (or `WASMTIME_HTTP_PROXY_SOCKET_ADDR`), `WASMTIME_HTTP_BACKLOG`,
 //! `WASIHOST_H2C_AUTHORITIES=host:port,...`, `WASIHOST_INSTANCE_REUSE` (0 = unbounded),
 //! `WASIHOST_INSTANCE_CONCURRENCY`, `WASIHOST_REQUEST_TIMEOUT_S`, `WASIHOST_MAX_INSTANCES`
-//! (unset or 0 = unbounded).
+//! (unset or 0 = unbounded), `WASIHOST_METRICS_ADDR` (e.g. `0.0.0.0:9464`; unset = no
+//! metrics endpoint).
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -217,11 +218,101 @@ impl WorkerExpiration for Expiration {
     }
 }
 
+/// Per-pod counters, served as Prometheus text on `WASIHOST_METRICS_ADDR` when set. The shim's
+/// listeners live in the pod's network namespace, so the endpoint is a pod port: scraped per
+/// pod without node access (the lab gives none). Live instances exist only here; the node
+/// sees one shim process.
+#[derive(Default)]
+struct Metrics {
+    instances_live: AtomicUsize,
+    instances_started: AtomicU64,
+    requests_total: AtomicU64,
+    requests_inflight: AtomicUsize,
+    requests_queued: AtomicUsize,
+    request_errors_total: AtomicU64,
+    queue_wait_us_total: AtomicU64,
+}
+
+impl Metrics {
+    fn render(&self, inflight_limit: Option<usize>) -> String {
+        let mut out = String::new();
+        let mut put = |name: &str, kind: &str, help: &str, value: String| {
+            out.push_str(&format!("# HELP {name} {help}\n# TYPE {name} {kind}\n{name} {value}\n"));
+        };
+        put("wasihost_instances_live", "gauge", "Guest instances alive now.",
+            self.instances_live.load(Relaxed).to_string());
+        put("wasihost_instances_started_total", "counter", "Guest instances started.",
+            self.instances_started.load(Relaxed).to_string());
+        put("wasihost_requests_total", "counter", "Requests received.",
+            self.requests_total.load(Relaxed).to_string());
+        put("wasihost_requests_inflight", "gauge", "Requests past the cap, until the response head.",
+            self.requests_inflight.load(Relaxed).to_string());
+        put("wasihost_requests_queued", "gauge", "Requests waiting at the in-flight cap.",
+            self.requests_queued.load(Relaxed).to_string());
+        put("wasihost_request_errors_total", "counter", "Requests answered 500 (guest error, trap, expiry).",
+            self.request_errors_total.load(Relaxed).to_string());
+        put("wasihost_queue_wait_seconds_total", "counter", "Time requests spent waiting at the cap.",
+            (self.queue_wait_us_total.load(Relaxed) as f64 / 1e6).to_string());
+        if let Some(l) = inflight_limit {
+            put("wasihost_inflight_limit", "gauge", "WASIHOST_MAX_INSTANCES x per-instance concurrency.",
+                l.to_string());
+        }
+        out
+    }
+}
+
+/// Holds a gauge up while alive, so every exit path (errors, cancelled futures) decrements.
+struct GaugeGuard<'a>(&'a AtomicUsize);
+
+impl<'a> GaugeGuard<'a> {
+    fn new(g: &'a AtomicUsize) -> Self {
+        g.fetch_add(1, Relaxed);
+        GaugeGuard(g)
+    }
+}
+
+impl Drop for GaugeGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Relaxed);
+    }
+}
+
+async fn serve_metrics(
+    listener: TcpListener,
+    metrics: Arc<Metrics>,
+    inflight_limit: Option<usize>,
+    cancel: CancellationToken,
+) {
+    loop {
+        let stream = tokio::select! {
+            conn = tcp_accept(&listener) => match conn { Some(c) => c, None => continue },
+            _ = cancel.cancelled() => return,
+        };
+        let metrics = metrics.clone();
+        tokio::spawn(async move {
+            let svc = hyper::service::service_fn(move |_req| {
+                let body = metrics.render(inflight_limit);
+                async move {
+                    Ok::<_, std::convert::Infallible>(
+                        hyper::Response::builder()
+                            .header("content-type", "text/plain; version=0.0.4")
+                            .body(http_body_util::Full::new(Bytes::from(body)))
+                            .unwrap(),
+                    )
+                }
+            });
+            let _ = hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(stream), svc)
+                .await;
+        });
+    }
+}
+
 struct Worker {
     reuse: usize,
     concurrency: usize,
     request_timeout: Duration,
-    live: Arc<AtomicUsize>,
+    metrics: Arc<Metrics>,
 }
 
 impl WorkerState for Worker {
@@ -252,7 +343,7 @@ impl WorkerState for Worker {
             log::error!("worker failed: {e:?}");
         }
         drop(store);
-        self.live.fetch_sub(1, Relaxed);
+        self.metrics.instances_live.fetch_sub(1, Relaxed);
     }
 }
 
@@ -266,8 +357,8 @@ struct State {
     concurrency: usize,
     request_timeout: Duration,
     limit: Option<Arc<Semaphore>>,
-    // live instances, logged at each start: the in-flight cap bounds them only indirectly
-    live: Arc<AtomicUsize>,
+    // live instances are logged at each start too: the in-flight cap bounds them only indirectly
+    metrics: Arc<Metrics>,
     next_instance: AtomicU64,
     next_request: AtomicU64,
 }
@@ -289,7 +380,8 @@ impl HandlerState for State {
         };
         let mut store = Store::new(&self.engine, host);
         let proxy = self.pre.instantiate_async(&mut store).await?;
-        let live = self.live.fetch_add(1, Relaxed) + 1;
+        self.metrics.instances_started.fetch_add(1, Relaxed);
+        let live = self.metrics.instances_live.fetch_add(1, Relaxed) + 1;
         log::info!("instance {id} started, {live} live");
         Ok(Instance {
             store,
@@ -304,7 +396,7 @@ impl HandlerState for State {
                 reuse: self.reuse,
                 concurrency: self.concurrency,
                 request_timeout: self.request_timeout,
-                live: self.live.clone(),
+                metrics: self.metrics.clone(),
             },
         })
     }
@@ -352,16 +444,26 @@ async fn handle(
     handler: ProxyHandler<State>,
     req: hyper::Request<hyper::body::Incoming>,
 ) -> Result<hyper::Response<WasiBody>, std::convert::Infallible> {
-    let id = handler.state().next_request.fetch_add(1, Relaxed);
+    let state = handler.state();
+    let id = state.next_request.fetch_add(1, Relaxed);
+    state.metrics.requests_total.fetch_add(1, Relaxed);
     // Held until the guest has produced the response head; excess requests queue here.
-    let _permit = match &handler.state().limit {
-        Some(limit) => Some(limit.clone().acquire_owned().await.expect("never closed")),
+    let _permit = match &state.limit {
+        Some(limit) => {
+            let _queued = GaugeGuard::new(&state.metrics.requests_queued);
+            let t = Instant::now();
+            let p = limit.clone().acquire_owned().await.expect("never closed");
+            state.metrics.queue_wait_us_total.fetch_add(t.elapsed().as_micros() as u64, Relaxed);
+            Some(p)
+        }
         None => None,
     };
+    let _inflight = GaugeGuard::new(&state.metrics.requests_inflight);
     let req = req.map(|b| b.map_err(wasmtime_wasi_http::Error::from).boxed_unsync());
     match handler.handle(id, req).await {
         Ok(resp) => Ok(resp),
         Err(e) => {
+            state.metrics.request_errors_total.fetch_add(1, Relaxed);
             log::error!("request {id}: {e:?}");
             let body = http_body_util::Full::new(Bytes::from_static(b"guest error"))
                 .map_err(wasmtime_wasi_http::Error::from)
@@ -451,11 +553,22 @@ pub(crate) async fn serve_conn(
             env_usize(&env, "WASIHOST_REQUEST_TIMEOUT_S", 30) as u64,
         ),
         limit: instance_limit(&env),
-        live: Arc::new(AtomicUsize::new(0)),
+        metrics: Arc::new(Metrics::default()),
         next_instance: AtomicU64::new(0),
         next_request: AtomicU64::new(0),
     };
+    let metrics = state.metrics.clone();
+    let inflight_limit = state.limit.as_ref().map(|l| l.available_permits());
     let handler = ProxyHandler::new(state);
+
+    let metrics_task = match env.get("WASIHOST_METRICS_ADDR") {
+        Some(a) => {
+            let l = TcpListener::bind(a.parse::<SocketAddr>()?).await?;
+            log::info!("metrics on http://{}/metrics", l.local_addr()?);
+            Some(tokio::spawn(serve_metrics(l, metrics, inflight_limit, cancel.clone())))
+        }
+        None => None,
+    };
 
     let socket = match addr {
         SocketAddr::V4(_) => tokio::net::TcpSocket::new_v4()?,
@@ -492,6 +605,9 @@ pub(crate) async fn serve_conn(
 
     tracker.close();
     tracker.wait().await;
+    if let Some(t) = metrics_task {
+        let _ = t.await;
+    }
     Ok(())
 }
 
@@ -508,6 +624,64 @@ mod tests {
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {
         pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn metrics_render_prometheus_text() {
+        let m = Metrics::default();
+        m.instances_started.fetch_add(3, Relaxed);
+        m.instances_live.fetch_add(2, Relaxed);
+        m.requests_total.fetch_add(7, Relaxed);
+        m.request_errors_total.fetch_add(1, Relaxed);
+        m.queue_wait_us_total.fetch_add(1_500_000, Relaxed);
+        let text = m.render(Some(32));
+        for line in [
+            "wasihost_instances_live 2\n",
+            "wasihost_instances_started_total 3\n",
+            "wasihost_requests_total 7\n",
+            "wasihost_requests_inflight 0\n",
+            "wasihost_requests_queued 0\n",
+            "wasihost_request_errors_total 1\n",
+            "wasihost_queue_wait_seconds_total 1.5\n",
+            "wasihost_inflight_limit 32\n",
+            "# TYPE wasihost_instances_live gauge\n",
+            "# TYPE wasihost_requests_total counter\n",
+        ] {
+            assert!(text.contains(line), "missing {line:?} in:\n{text}");
+        }
+        // no cap: the limit gauge is absent rather than a fake number
+        assert!(!m.render(None).contains("wasihost_inflight_limit"));
+    }
+
+    #[test]
+    fn gauge_guard_counts_while_held() {
+        let g = AtomicUsize::new(0);
+        {
+            let _a = GaugeGuard::new(&g);
+            let _b = GaugeGuard::new(&g);
+            assert_eq!(g.load(Relaxed), 2);
+        }
+        assert_eq!(g.load(Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn metrics_endpoint_serves_render() {
+        let m = Arc::new(Metrics::default());
+        m.instances_live.fetch_add(4, Relaxed);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let cancel = CancellationToken::new();
+        let task = tokio::spawn(serve_metrics(listener, m.clone(), None, cancel.clone()));
+        let mut s = TcpStream::connect(addr).await.unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        s.write_all(b"GET /metrics HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n").await.unwrap();
+        let mut out = String::new();
+        s.read_to_string(&mut out).await.unwrap();
+        assert!(out.starts_with("HTTP/1.1 200"), "{out}");
+        assert!(out.contains("text/plain; version=0.0.4"), "{out}");
+        assert!(out.contains("wasihost_instances_live 4\n"), "{out}");
+        cancel.cancel();
+        task.await.unwrap();
     }
 
     #[test]
